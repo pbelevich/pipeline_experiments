@@ -70,11 +70,12 @@ def layer_on_device(device):
 
 
 class _pipeline_on_devices_helper():
-    def __init__(self, *devices):
+    def __init__(self, *devices, **config):
         self.devices = devices
+        self.config = config
 
     def __call__(self, pipeline_class, *args, **kwargs):
-        return pipeline_class(self.devices, *args, **kwargs)
+        return pipeline_class(self.devices, self.config, *args, **kwargs)
 
-def pipeline_on_devices(*devices):
-    return _pipeline_on_devices_helper(*devices)
+def pipeline_on_devices(*devices, **kwargs):
+    return _pipeline_on_devices_helper(*devices, **kwargs)

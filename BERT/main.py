@@ -14,7 +14,7 @@ import torch.distributed.autograd as dist_autograd
 
 from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
 from utils import run_demo, run_ddp, wrap_up
-from sharder import get_shards
+from sharder import MLMTaskSharder
 from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
 
 
@@ -138,9 +138,9 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
-    model = DistributedCPURPCSequential(
-        WorkerModule("worker1", layer_on_device("cuda:0"), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout)
-    )
+    # model = DistributedCPURPCSequential(
+    #     WorkerModule("worker1", layer_on_device("cuda:0"), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout)
+    # )
 
     # model = DistributedCPURPCSequential(
     #     WorkerModule("worker1", layer_on_device("cuda:0"), MLMTaskEmbedding, ntokens, args.emsize),
@@ -149,8 +149,20 @@ def run_main(args):
     # )
 
     # model = DistributedCPURPCSequential(
-    #     WorkerModule("worker1", pipeline_on_devices(0, 1, 2, 3, 4, 5, 6, 7), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout),
+    #     WorkerModule("worker1", pipeline_on_devices(0, 1, 2, 3, 4, 5, 6, 7, include_embeddings=True, n_encoders=args.nlayers, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
     # )
+
+    # model = DistributedCPURPCSequential(
+    #     WorkerModule("worker1", pipeline_on_devices(6, 4, 2, 0, include_embeddings=True, n_encoders=args.nlayers // 2), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+    #     WorkerModule("worker2", pipeline_on_devices(1, 3, 5, 7, n_encoders=args.nlayers // 2, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+    # )
+
+    model = DistributedCPURPCSequential(
+        WorkerModule("worker1", pipeline_on_devices(5, 2, include_embeddings=True, n_encoders=args.nlayers // 6, n_encoders_on_last_gpu=args.nlayers // 6), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+        WorkerModule("worker2", pipeline_on_devices(0, 7, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+        WorkerModule("worker3", pipeline_on_devices(1, 4, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+        WorkerModule("worker4", pipeline_on_devices(6, 3, n_encoders=args.nlayers // 6, n_encoders_on_first_gpu=args.nlayers // 6, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+    )
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
     print(f'Total parameters = {int(params.item() // 1e6)}M')
