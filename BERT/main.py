@@ -1,4 +1,5 @@
 import argparse
+import torch.multiprocessing as mp
 import math
 import sys
 import time
@@ -7,15 +8,19 @@ import os
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from torch.distributed.nn import RemoteModule
 from torch.utils.data import DataLoader
 import torch.distributed.rpc as rpc
 from torch.distributed.optim import DistributedOptimizer
 import torch.distributed.autograd as dist_autograd
 
-from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
-from utils import run_demo, run_ddp, wrap_up
-from sharder import MLMTaskSharder
-from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
+from .model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
+from .utils import run_demo, run_ddp, wrap_up
+from .sharder import MLMTaskSharder
+from .cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
+
+from fairscale.experimental.nn.distributed_pipeline import DistributedLoss, DistributedPipeline, PipelineModulesGraph
+from fairscale.experimental.nn.distributed_pipeline.trace import make_graph
 
 
 def collate_batch(batch_data, args, mask_id, cls_id):
@@ -29,7 +34,8 @@ def collate_batch(batch_data, args, mask_id, cls_id):
     batch_data = torch.cat((torch.tensor([[cls_id] * batch_data.size(1)]).long(), batch_data))
     lm_mask = torch.cat((torch.tensor([0.0]), lm_mask))
 
-    targets = torch.stack([batch_data[i] for i in range(lm_mask.size(0)) if lm_mask[i]]).view(-1)
+    #targets = torch.stack([batch_data[i] for i in range(lm_mask.size(0)) if lm_mask[i]]).view(-1)
+    targets = torch.stack([batch_data[i] for i in range(lm_mask.size(0))]).view(-1)
     batch_data = batch_data.masked_fill(lm_mask.bool().unsqueeze(1), mask_id)
     return batch_data, lm_mask, targets
 
@@ -40,9 +46,36 @@ def process_raw_data(raw_data, args):
     return raw_data
 
 
+class Loss(nn.Module):
+    def __init__(self, criterion, ntokens):
+        super().__init__()
+        self.ntokens = ntokens
+        self.criterion = criterion
+        #self.criterion = nn.CrossEntropyLoss()
+
+    def forward(self, input, target):
+        #print("INPUT:", input.sum().item())
+        return self.criterion(input.view(-1, self.ntokens), target.to(input.device))
+
+
+def run_batch(optimizer, model, loss_module, data, lm_mask, targets):
+    with dist_autograd.context() as context_id:
+        #data = data.to(0)
+        data = data.transpose(0, 1)
+        output = model(data)
+        #print("OUTPUT:", output.sum().item())
+        #output = rpc.RRef(output)
+        loss = loss_module(output, rpc.RRef(targets)).to_here()
+        #return loss.item()
+        dist_autograd.backward(context_id, [loss])
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        optimizer.step(context_id)
+
+    return loss.item()
+
 def train(model, vocab, train_loss_log, train_data,
           optimizer, criterion, ntokens, epoch, args):
-    model.train()
+    #model.train()
     total_loss = 0.
     start_time = time.time()
     mask_id = vocab.stoi['<MASK>']
@@ -51,16 +84,18 @@ def train(model, vocab, train_loss_log, train_data,
     dataloader = DataLoader(train_data, batch_size=args.batch_size * args.bptt,
                             shuffle=False, collate_fn=lambda b: collate_batch(b, args, mask_id, cls_id))
 
+    loss_module = DistributedLoss(Loss, criterion, ntokens)
+
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
-        with dist_autograd.context() as context_id:
-            data = data.transpose(0, 1)
-            output = model(data)
-            output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
-            loss = criterion(output.view(-1, ntokens), targets)
-            dist_autograd.backward(context_id, [loss])
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            optimizer.step(context_id)
-            total_loss += loss.item()
+        try:
+            loss = run_batch(optimizer, model, loss_module, data, lm_mask, targets)
+        except:
+            #print(rpc.rpc_sync("w3", torch.cuda.memory_stats, args=(3,)))
+            #time.sleep(60)
+            raise
+        #rpc.rpc_sync(f"w3", torch.cuda.empty_cache)
+        print("LOSS:", "%0.3f" % (loss,))
+        total_loss += loss
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
@@ -75,6 +110,11 @@ def train(model, vocab, train_loss_log, train_data,
             total_loss = 0
             start_time = time.time()
 
+
+class NoOp(nn.Module):
+    def forward(self, input):
+        #import math; print(input.shape,"=",math.prod(input.shape))
+        return input
 
 def run_main(args):
     import torchtext
@@ -157,12 +197,27 @@ def run_main(args):
     #     WorkerModule("worker2", pipeline_on_devices(1, 3, 5, 7, n_encoders=args.nlayers // 2, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
     # )
 
-    model = DistributedCPURPCSequential(
-        WorkerModule("worker1", pipeline_on_devices(5, 2, include_embeddings=True, n_encoders=args.nlayers // 6, n_encoders_on_last_gpu=args.nlayers // 6), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker2", pipeline_on_devices(0, 7, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker3", pipeline_on_devices(1, 4, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker4", pipeline_on_devices(6, 3, n_encoders=args.nlayers // 6, n_encoders_on_first_gpu=args.nlayers // 6, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-    )
+    layers = [RemoteModule("w0/cuda:0", MLMTaskEmbedding, (ntokens, args.emsize))]
+    n_encoders = args.nlayers
+    if not False:
+      for i, device in enumerate([f"w{i}/cuda:{i}" for i in (0, 1, 2, 3, 4, 5, 6)]):
+        this_encoders = n_encoders // (7-i)
+        layers.append(RemoteModule(device, MLMTaskEncoder, (args.emsize,  args.nhead, args.nhid, this_encoders, args.dropout)))
+        n_encoders -= this_encoders
+    layers.append(RemoteModule("w7/cuda:7", MLMTaskHead, (ntokens, args.emsize)))
+    #layers.append(RemoteModule("w3/cuda:3", NoOp, ()))
+    org_model = nn.Sequential(*layers)
+
+    #org_model = nn.Sequential(*(
+    #        MLMTaskSharder(["w5/cuda:5", "w2/cuda:2"], dict(include_embeddings=True, n_encoders=args.nlayers // 6, n_encoders_on_last_gpu=args.nlayers // 6), ntokens, args.emsize, args.nhead, args.nhid, args.dropout)
+    #        +MLMTaskSharder(["w0/cuda:0", "w7/cuda:7"], dict(n_encoders=args.nlayers // 3), ntokens, args.emsize, args.nhead, args.nhid, args.dropout)
+    #        +MLMTaskSharder(["w1/cuda:1", "w4/cuda:4"], dict(n_encoders=args.nlayers // 3), ntokens, args.emsize, args.nhead, args.nhid, args.dropout)
+    #        +MLMTaskSharder(["w6/cuda:6", "w3/cuda:3"], dict(n_encoders=args.nlayers // 6, n_encoders_on_first_gpu=args.nlayers // 6, include_head=True), ntokens, args.emsize, args.nhead, args.nhid, args.dropout)
+    #    ))
+
+    graph = make_graph(org_model)
+    #for node in graph.nodes: print(node.module.on, node.get_name())
+    model = DistributedPipeline(graph, chunks=8)
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
     print(f'Total parameters = {int(params.item() // 1e6)}M')
@@ -182,28 +237,28 @@ def run_main(args):
               optimizer, criterion, ntokens, epoch, args)
 
 
-def run_worker(rank, world_size, args):
+def run_worker(rank, args):
+    first_rank = (args.world_size // args.num_workers) * int(os.environ.get('SLURM_PROCID', '0'))
+    rank += first_rank
+
+    print("rank:", rank)
+    torch.cuda.set_per_process_memory_fraction(0.9, rank - first_rank)
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
+    for i in range(args.world_size):
+        options.set_device_map(f"w{i}", {rank - first_rank: i % (args.world_size // args.num_workers)})
+    rpc.init_rpc(
+        f"w{rank}",
+        rank=rank,
+        world_size=args.world_size,
+        rpc_backend_options=options
+    )
 
-    if rank == 0:
-        rpc.init_rpc(
-            "master",
-            rank=rank,
-            world_size=world_size,
-            rpc_backend_options=options
-        )
+    if rank == first_rank:
         run_main(args)
-    else:
-        rpc.init_rpc(
-            f"worker{rank}",
-            rank=rank,
-            world_size=world_size,
-            rpc_backend_options=options
-        )
-    
+
     rpc.shutdown()
 
 
@@ -255,9 +310,13 @@ if __name__ == "__main__":
                         help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
     parser.add_argument('--gpus', type=int, default=1,
                         help='number of GPUs per worker node to use')
+    parser.add_argument('--num_workers', type=int, default=1,
+                        help='number of GPUs per worker node to use')
     parser.add_argument('--rpc', type=str, default='cpu',
-                        help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')    
+                        help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')
     args = parser.parse_args()
 
-    print(f"rank = {args.rank} pid = {os.getpid()}")
-    run_worker(args.rank, args.world_size, args)
+    assert args.world_size % args.num_workers == 0
+
+    #run_worker(args.rank, args.world_size, args)
+    mp.spawn(run_worker, args=(args,), nprocs=args.world_size // args.num_workers)

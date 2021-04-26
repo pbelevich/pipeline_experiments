@@ -1,5 +1,7 @@
 import torch.nn as nn
-from model import MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead, MLMTask2
+from torch.distributed.nn import RemoteModule
+from typing import Any, Dict, List, NamedTuple, Tuple
+from .model import MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead, MLMTask2
 from torch.distributed.rpc import RRef
 
 class LocalPipelineImpl(nn.Module):
@@ -17,6 +19,14 @@ class LocalPipelineImpl(nn.Module):
     def parameter_rrefs(self):
         return [RRef(p) for p in self.seq.parameters()]
 
+class RemoteModuleParams(NamedTuple):
+    module_cls: nn.Module
+    args: Tuple
+    kwargs: Dict[str, Any] = {}
+
+    def instantiate(self, device):
+        return RemoteModule(device, self.module_cls, self.args, self.kwargs)
+
 
 def MLMTaskSharder(devices, config, ntoken, ninp, nhead, nhid, dropout):
     gpus = len(devices)
@@ -32,13 +42,13 @@ def MLMTaskSharder(devices, config, ntoken, ninp, nhead, nhid, dropout):
     if gpus == 1:
         sublayers = []
         if add_embedding:
-            sublayers.append(MLMTaskEmbedding(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskEmbedding, (ntoken, ninp)))
         if n_encoders > 0:
-            sublayers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders, dropout))
+            sublayers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders, dropout)))
         if add_head:
-            sublayers.append(MLMTaskHead(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskHead, (ntoken, ninp)))
         if sublayers:
-            layers.append(nn.Sequential(*sublayers).to(devices[0]))
+            layers.extend(layer.instantiate(devices[0]) for layer in sublayers)
     elif gpus == 2:
         if n_encoders_on_first_gpu == 0 and n_encoders_on_last_gpu == 0:
             assert(n_encoders % 2 == 0)
@@ -53,20 +63,20 @@ def MLMTaskSharder(devices, config, ntoken, ninp, nhead, nhid, dropout):
 
         sublayers = []
         if add_embedding:
-            sublayers.append(MLMTaskEmbedding(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskEmbedding, (ntoken, ninp)))
         if n_encoders_on_first_gpu > 0:
-            sublayers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders_on_first_gpu, dropout))
+            sublayers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders_on_first_gpu, dropout)))
         if sublayers:
-            layers.append(nn.Sequential(*sublayers).to(devices[0]))
+            layers.extend(layer.instantiate(devices[0]) for layer in sublayers)
 
         sublayers = []
         if n_encoders_on_last_gpu > 0:
-            sublayers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders_on_last_gpu, dropout))
+            sublayers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders_on_last_gpu, dropout)))
         if add_head:
-            sublayers.append(MLMTaskHead(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskHead, (ntoken, ninp)))
         if sublayers:
-            layers.append(nn.Sequential(*sublayers).to(devices[1]))
-        
+            layers.extend(layer.instantiate(devices[1]) for layer in sublayers)
+
     else:
         n_encoders_on_middle_gpus = n_encoders - n_encoders_on_first_gpu - n_encoders_on_last_gpu
         middle_gpus = gpus - int(add_embedding) - int(add_head)
@@ -75,26 +85,26 @@ def MLMTaskSharder(devices, config, ntoken, ninp, nhead, nhid, dropout):
 
         sublayers = []
         if add_embedding:
-            sublayers.append(MLMTaskEmbedding(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskEmbedding, (ntoken, ninp)))
         if n_encoders_on_first_gpu > 0:
-            sublayers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders_on_first_gpu, dropout))
+            sublayers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders_on_first_gpu, dropout)))
         if sublayers:
-            layers.append(nn.Sequential(*sublayers).to(devices[0]))
+            layers.extend(layer.instantiate(devices[0]) for layer in sublayers)
 
         for gpu in range(int(add_embedding), int(add_embedding) + middle_gpus):
-            layers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders_per_middle_gpu, dropout).to(devices[gpu]))
+            layers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders_per_middle_gpu, dropout)).instantiate(devices[gpu]))
 
         sublayers = []
         if n_encoders_on_last_gpu > 0:
-            sublayers.append(MLMTaskEncoder(ninp, nhead, nhid, n_encoders_on_last_gpu, dropout))
+            sublayers.append(RemoteModuleParams(MLMTaskEncoder, (ninp, nhead, nhid, n_encoders_on_last_gpu, dropout)))
         if add_head:
-            sublayers.append(MLMTaskHead(ntoken, ninp))
+            sublayers.append(RemoteModuleParams(MLMTaskHead, (ntoken, ninp)))
         if sublayers:
-            layers.append(nn.Sequential(*sublayers).to(devices[gpus - 1]))
+            layers.extend(layer.instantiate(devices[gpus - 1]) for layer in sublayers)
 
     assert len(layers) == gpus #, f"gpus = {gpus}, layers = {layers}"
 
-    return LocalPipelineImpl(nn.Sequential(*layers))
+    return layers
 
 
 # def get_shards(workers, gpus, ntoken, ninp, nhead, nhid, nlayers, dropout):

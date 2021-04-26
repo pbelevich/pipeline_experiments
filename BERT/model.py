@@ -167,10 +167,11 @@ class MLMTask3(nn.Module):
 class MLMTaskEmbedding(nn.Module):
     def __init__(self, ntoken, ninp):
         super().__init__()
-        self.bert_embed = BertEmbedding(ntoken, ninp)        
+        self.bert_embed = BertEmbedding(ntoken, ninp)
 
     def forward(self, src, token_type_input=None):
-        return self.bert_embed((src.transpose(0, 1), token_type_input))
+        result = self.bert_embed((src.transpose(0, 1), token_type_input))
+        return result
 
 
 class MLMTaskEncoder(nn.Module):
