@@ -12,7 +12,5 @@
 
 #SBATCH --time=10:00
 
-# export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
-# export MASTER_PORT=29500
 srun --label mnist1_cpu.sh
 

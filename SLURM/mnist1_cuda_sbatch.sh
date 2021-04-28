@@ -13,4 +13,3 @@
 #SBATCH --time=10:00
 
 srun --label mnist1_cuda.sh
-

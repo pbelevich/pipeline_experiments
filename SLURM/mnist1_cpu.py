@@ -1,17 +1,15 @@
 import argparse
+import os
+
 import torch
+import torch.distributed.autograd as dist_autograd
+import torch.distributed.rpc as rpc
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-import torch.multiprocessing as mp
-import torch.distributed.rpc as rpc
-import os
-import concurrent.futures
 from torch.distributed.optim import DistributedOptimizer
-from torch.distributed.rpc import RRef
-import torch.distributed.autograd as dist_autograd
-from tqdm import tqdm
-from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
+from torchvision import datasets, transforms
+
+from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device
 
 
 def run_main():
@@ -47,7 +45,7 @@ def run_main():
 
     max_epochs = 10
     for epoch in range(max_epochs):
-        print(f"Epoch: {epoch+1}")
+        print(f"Epoch: {epoch + 1}")
         epoch_correct = 0
         epoch_all = 0
         for k, dataloader in loaders.items():
@@ -74,7 +72,7 @@ def run_main():
                         epoch_correct += correct.item()
                         epoch_all += all
 
-            acc = epoch_correct/epoch_all if epoch_all != 0 else -1
+            acc = epoch_correct / epoch_all if epoch_all != 0 else -1
             print(f"Loader: {k}. Accuracy: {acc}")
 
 
@@ -116,4 +114,3 @@ if __name__ == "__main__":
 
     args = parser.parse_args()
     run_worker(args.rank, args.world_size, args)
-

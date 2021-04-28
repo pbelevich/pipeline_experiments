@@ -1,20 +1,18 @@
 import argparse
+import os
+
 import torch
+import torch.distributed.autograd as dist_autograd
+import torch.distributed.rpc as rpc
 import torch.nn as nn
 import torch.optim as optim
-from torchvision import datasets, transforms
-import torch.multiprocessing as mp
-import torch.distributed.rpc as rpc
-import os
-import concurrent.futures
 from torch.distributed.optim import DistributedOptimizer
-from torch.distributed.rpc import RRef
-import torch.distributed.autograd as dist_autograd
-from tqdm import tqdm
-from cuda_rpc import DistributedCUDARPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
+from torchvision import datasets, transforms
+
+from cuda_rpc import DistributedCUDARPCSequential, WorkerModule, layer_on_device
 
 
-def run_main(world_size):
+def run_main():
     batch_size = 100
 
     transform = transforms.Compose([
@@ -47,7 +45,7 @@ def run_main(world_size):
 
     max_epochs = 10
     for epoch in range(max_epochs):
-        print(f"Epoch: {epoch+1}")
+        print(f"Epoch: {epoch + 1}")
         epoch_correct = 0
         epoch_all = 0
         for k, dataloader in loaders.items():
@@ -75,8 +73,8 @@ def run_main(world_size):
                         all = len(y_batch)
                         epoch_correct += correct.item()
                         epoch_all += all
-                                  
-            print(f"Loader: {k}. Accuracy: {epoch_correct/epoch_all}")
+
+            print(f"Loader: {k}. Accuracy: {epoch_correct / epoch_all}")
 
 
 def run_worker(rank, world_size, args):
@@ -85,19 +83,12 @@ def run_worker(rank, world_size, args):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
 
     if rank == 0:
-        options.set_device_map("worker1", {0:0})
-        options.set_device_map("worker2", {0:0})
-        options.set_device_map("worker3", {0:0})
-        options.set_device_map("worker4", {0:0})
-        options.set_device_map("worker5", {0:0})
-        options.set_device_map("worker6", {0:0})
-
-        # for i in range(1, world_size):
-        #     gpu = i - 1
-        #     options.set_device_map(f"worker{i}", {gpu:gpu})
-        #     # print(f'options.set_device_map("worker{i}", {gpu}:{gpu})')
-
-        # options.set_device_map("worker1", {0:0, 1:1, 2:2, 3:3, 4:4, 5:5})
+        options.set_device_map("worker1", {0: 0})
+        options.set_device_map("worker2", {0: 0})
+        options.set_device_map("worker3", {0: 0})
+        options.set_device_map("worker4", {0: 0})
+        options.set_device_map("worker5", {0: 0})
+        options.set_device_map("worker6", {0: 0})
 
         rpc.init_rpc(
             "master",
@@ -105,27 +96,18 @@ def run_worker(rank, world_size, args):
             world_size=world_size,
             rpc_backend_options=options
         )
-        run_main(world_size)
+        run_main()
     else:
         if rank == 1:
-            options.set_device_map("worker2", {0:0})
+            options.set_device_map("worker2", {0: 0})
         elif rank == 2:
-            options.set_device_map("worker3", {0:0})
+            options.set_device_map("worker3", {0: 0})
         elif rank == 3:
-            options.set_device_map("worker4", {0:0})
+            options.set_device_map("worker4", {0: 0})
         elif rank == 4:
-            options.set_device_map("worker5", {0:0})
+            options.set_device_map("worker5", {0: 0})
         elif rank == 5:
-            options.set_device_map("worker6", {0:0})
-        
-        # if rank != world_size - 1:
-        #     src_gpu = rank - 1
-        #     dest_worker = f"worker{rank+1}"
-        #     dest_gpu = rank
-        #     options.set_device_map(dest_worker, {src_gpu:dest_gpu})
-        #     # print(f'options.set_device_map("{dest_worker}", {src_gpu}:{dest_gpu})')
-
-        # options.set_device_map("master", {0:0, 1:1, 2:2, 3:3, 4:4, 5:5})
+            options.set_device_map("worker6", {0: 0})
 
         rpc.init_rpc(
             f"worker{rank}",
@@ -137,7 +119,7 @@ def run_worker(rank, world_size, args):
     rpc.shutdown()
 
 
-if __name__=="__main__":
+if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Pipeline experiments')
 
     parser.add_argument('--world_size', type=int, default=None,
@@ -151,4 +133,3 @@ if __name__=="__main__":
 
     args = parser.parse_args()
     run_worker(args.rank, args.world_size, args)
-

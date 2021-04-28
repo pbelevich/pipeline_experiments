@@ -1,18 +1,19 @@
 import os
 import socket
 import subprocess
-import time
 
-import torch.nn as nn
 import torch.distributed.rpc as rpc
+import torch.nn as nn
 from torch.distributed.rpc import RRef
+
 
 class DistributedCUDARPCSequential(nn.Module):
     def __init__(self, *worker_layers):
         super().__init__()
         self.worker_layers = worker_layers
         first = worker_layers[0]
-        self.first_shard = rpc.remote(first.worker, LocalWrapper, (worker_layers[1:], first.remote_class_creator, *(first.args)), **(first.kwargs))
+        self.first_shard = rpc.remote(first.worker, LocalWrapper,
+                                      (worker_layers[1:], first.remote_class_creator, *(first.args)), **(first.kwargs))
 
     def forward(self, x):
         x = self.first_shard.remote().forward(x)
@@ -46,7 +47,9 @@ class LocalWrapper(nn.Module):
             self.next_shard = None
         else:
             first = worker_layers[0]
-            self.next_shard = rpc.remote(first.worker, LocalWrapper, (worker_layers[1:], first.remote_class_creator, *(first.args)), **(first.kwargs))
+            self.next_shard = rpc.remote(first.worker, LocalWrapper,
+                                         (worker_layers[1:], first.remote_class_creator, *(first.args)),
+                                         **(first.kwargs))
 
     def train(self, mode=True):
         self.local_net.train(mode=mode)
@@ -88,6 +91,7 @@ class _layer_on_device_helper():
         print(f"Materializing {layer_class} on {socket.gethostname()}:{get_my_gpu_index()}")
         return res
 
+
 def layer_on_device(device):
     return _layer_on_device_helper(device)
 
@@ -100,6 +104,7 @@ class _pipeline_on_devices_helper():
 
     def __call__(self, pipeline_class, *args, **kwargs):
         return pipeline_class(self.devices, self.config, *args, **kwargs)
+
 
 def pipeline_on_devices(*devices, **kwargs):
     return _pipeline_on_devices_helper(*devices, **kwargs)

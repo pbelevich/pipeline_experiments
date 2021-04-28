@@ -1,23 +1,22 @@
 import os
 import socket
 import subprocess
-import time
 
-import torch
-import torch.nn as nn
 import torch.distributed.rpc as rpc
+import torch.nn as nn
 from torch.distributed.rpc import RRef
+
 
 class DistributedCPURPCSequential(nn.Module):
     def __init__(self, *worker_layers):
         super().__init__()
         self.worker_layers = worker_layers
 
-    def forward(self, x): # x is cpu tensor on master
-        x_rref = RRef(x) # x_rref is initially on master cpu
+    def forward(self, x):  # x is cpu tensor on master
+        x_rref = RRef(x)  # x_rref is initially on master cpu
         for worker_layer in self.worker_layers:
-            x_rref = worker_layer(x_rref) # pass to worker layer
-        return x_rref.to_here() # get x to master cpu
+            x_rref = worker_layer(x_rref)  # pass to worker layer
+        return x_rref.to_here()  # get x to master cpu
 
     def train(self, mode=True):
         for worker_layer in self.worker_layers:
@@ -32,6 +31,7 @@ class DistributedCPURPCSequential(nn.Module):
             remote_params.extend(worker_layer.parameter_rrefs().to_here())
         return remote_params
 
+
 class WorkerModule(nn.Module):
     def __init__(self, worker, remote_class_creator, *args, **kwargs):
         super().__init__()
@@ -45,6 +45,7 @@ class WorkerModule(nn.Module):
 
     def parameter_rrefs(self):
         return self.remote_module.remote().parameter_rrefs()
+
 
 class LocalWrapper(nn.Module):
     def __init__(self, local_net_creator, *args, **kwargs):
@@ -86,6 +87,7 @@ class _layer_on_device_helper():
         print(f"Materializing {layer_class} on {socket.gethostname()}:{get_my_gpu_index()}")
         return res
 
+
 def layer_on_device(device):
     return _layer_on_device_helper(device)
 
@@ -98,6 +100,7 @@ class _pipeline_on_devices_helper():
 
     def __call__(self, pipeline_class, *args, **kwargs):
         return pipeline_class(self.devices, self.config, *args, **kwargs)
+
 
 def pipeline_on_devices(*devices, **kwargs):
     return _pipeline_on_devices_helper(*devices, **kwargs)
