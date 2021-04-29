@@ -99,17 +99,15 @@ def run_worker(rank, world_size, args):
         run_main()
     else:
         if rank == 1:
-            options.set_device_map("master", {0:0})
+            options.set_device_map("worker2", {0: 0})
         elif rank == 2:
-            options.set_device_map("worker1", {0:0})
+            options.set_device_map("worker3", {0: 0})
         elif rank == 3:
-            options.set_device_map("worker2", {0:0})
+            options.set_device_map("worker4", {0: 0})
         elif rank == 4:
-            options.set_device_map("worker3", {0:0})
+            options.set_device_map("worker5", {0: 0})
         elif rank == 5:
-            options.set_device_map("worker4", {0:0})
-        elif rank == 6:
-            options.set_device_map("worker5", {0:0})
+            options.set_device_map("worker6", {0: 0})
 
         rpc.init_rpc(
             f"worker{rank}",
