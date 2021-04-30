@@ -3,13 +3,19 @@ import os
 
 import torch
 import torch.distributed.autograd as dist_autograd
+import torch.multiprocessing as mp
 import torch.distributed.rpc as rpc
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributed.optim import DistributedOptimizer
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
-from cuda_rpc import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+from cuda_rpc_forward_tensor import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+
+
+IS_SLURM = os.getenv('SLURM_LOCALID')
+USE_TQDM = os.getenv('USE_TQDM', True if not IS_SLURM else False)
 
 
 def run_main():
@@ -49,7 +55,7 @@ def run_main():
         epoch_correct = 0
         epoch_all = 0
         for k, dataloader in loaders.items():
-            for i, (x_batch, y_batch) in enumerate(dataloader):
+            for i, (x_batch, y_batch) in enumerate(tqdm(dataloader) if USE_TQDM else dataloader):
                 x_batch = x_batch.to(0)
                 y_batch = y_batch.to(0)
                 if k == "train":
@@ -98,6 +104,8 @@ def run_worker(rank, world_size, args):
         )
         run_main()
     else:
+        if not IS_SLURM:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
         if rank == 1:
             options.set_device_map("worker2", {0: 0})
         elif rank == 2:
@@ -122,7 +130,7 @@ def run_worker(rank, world_size, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Pipeline experiments')
 
-    parser.add_argument('--world_size', type=int, default=None,
+    parser.add_argument('--world_size', type=int, default=7,
                         help='the world size')
     parser.add_argument('--rank', type=int, default=None,
                         help="Global rank of this process. Pass in 0 for master.")
@@ -132,4 +140,7 @@ if __name__ == "__main__":
                         help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
 
     args = parser.parse_args()
-    run_worker(args.rank, args.world_size, args)
+    if args.rank is None:
+        mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
+    else:
+        run_worker(args.rank, args.world_size, args)

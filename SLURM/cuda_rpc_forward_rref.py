@@ -13,7 +13,7 @@ class DistributedCUDARPCSequential(nn.Module):
         self.worker_layers = worker_layers
 
     def forward(self, x):  # x is cpu tensor on master
-        x_rref = RRef(x)  # x_rref is initially on master cpu
+        x_rref = RRef(x, devices=[0])  # x_rref is initially on master cpu
         for worker_layer in self.worker_layers:
             x_rref = worker_layer(x_rref)  # pass to worker layer
         return x_rref.to_here()  # get x to master cpu
@@ -62,7 +62,7 @@ class LocalWrapper(nn.Module):
         return self.local_net(x)
 
     def parameter_rrefs(self):
-        return [RRef(p) for p in self.local_net.parameters()]
+        return [RRef(p, devices=[0]) for p in self.local_net.parameters()]
 
 
 def get_my_gpu_index():

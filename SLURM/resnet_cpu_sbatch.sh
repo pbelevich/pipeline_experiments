@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=mnist1_cuda_sbatch
+#SBATCH --job-name=resnet_cpu_sbatch
 
 #SBATCH --partition=q2
 
@@ -10,6 +10,6 @@
 
 #SBATCH --gpus-per-task=1
 
-#SBATCH --time=10:00
+#SBATCH --time=1:00:00
 
-srun --label mnist1_cuda.sh
+srun --label resnet_cpu.sh

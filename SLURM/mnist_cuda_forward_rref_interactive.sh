@@ -1,11 +1,13 @@
 #!/bin/bash
 
+export USE_TQDM=1
+
 srun --label \
-	--job-name=mnist1_cpu_interactive \
+	--job-name=mnist_cuda_forward_rref_interactive \
 	--ntasks=8 \
 	--partition=q2 \
 	--nodes=4 \
 	--gpus-per-node=2 \
 	--gpus-per-task=1 \
-	--time=10:00 \
-	mnist1_cpu.sh
+	--time=30:00 \
+	mnist_cuda_forward_rref.sh
