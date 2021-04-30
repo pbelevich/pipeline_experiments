@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export USE_TQDM = 1
+
 srun --label \
 	--job-name=mnist_cpu_interactive \
 	--ntasks=8 \

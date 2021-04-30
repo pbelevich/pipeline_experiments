@@ -1,5 +1,7 @@
 #!/bin/bash
 
+export USE_TQDM = 1
+
 srun --label \
 	--job-name=resnet_cuda_forward_rref_interactive \
 	--ntasks=8 \

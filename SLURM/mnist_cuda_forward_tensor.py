@@ -15,6 +15,7 @@ from cuda_rpc_forward_tensor import DistributedCUDARPCSequential, WorkerModule, 
 
 
 IS_SLURM = os.getenv('SLURM_LOCALID')
+USE_TQDM = os.getenv('USE_TQDM', True if not IS_SLURM else False)
 
 
 def run_main():
@@ -54,7 +55,7 @@ def run_main():
         epoch_correct = 0
         epoch_all = 0
         for k, dataloader in loaders.items():
-            for i, (x_batch, y_batch) in enumerate(dataloader if IS_SLURM else tqdm(dataloader)):
+            for i, (x_batch, y_batch) in enumerate(tqdm(dataloader) if USE_TQDM else dataloader):
                 x_batch = x_batch.to(0)
                 y_batch = y_batch.to(0)
                 if k == "train":
