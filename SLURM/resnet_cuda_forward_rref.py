@@ -12,7 +12,7 @@ from torchvision import datasets, transforms
 from resnet import ResNet50
 from tqdm import tqdm
 
-from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device
+from cuda_rpc_forward_rref import DistributedCUDARPCSequential, WorkerModule, layer_on_device
 
 
 IS_SLURM = os.getenv('SLURM_LOCALID')
@@ -65,7 +65,7 @@ def run_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
 
-    model = DistributedCPURPCSequential(
+    model = DistributedCUDARPCSequential(
         WorkerModule("worker1", layer_on_device("cuda"), layer0),
         WorkerModule("worker2", layer_on_device("cuda"), layer1),
         WorkerModule("worker3", layer_on_device("cuda"), layer2),
@@ -89,6 +89,8 @@ def run_main():
         epoch_all = 0
         for k, dataloader in loaders.items():
             for i, (x_batch, y_batch) in enumerate(dataloader if IS_SLURM else tqdm(dataloader)):
+                x_batch = x_batch.to(0)
+                y_batch = y_batch.to(0)
                 if k == "train":
                     model.train()
                     with dist_autograd.context() as context_id:
@@ -111,16 +113,22 @@ def run_main():
                         epoch_correct += correct.item()
                         epoch_all += all
 
-            acc = epoch_correct / epoch_all if epoch_all != 0 else -1
-            print(f"Loader: {k}. Accuracy: {acc}")
+            print(f"Loader: {k}. Accuracy: {epoch_correct / epoch_all}")
 
 
 def run_worker(rank, world_size, args):
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=300)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
 
     if rank == 0:
+        options.set_device_map("worker1", {0: 0})
+        options.set_device_map("worker2", {0: 0})
+        options.set_device_map("worker3", {0: 0})
+        options.set_device_map("worker4", {0: 0})
+        options.set_device_map("worker5", {0: 0})
+        options.set_device_map("worker6", {0: 0})
+
         rpc.init_rpc(
             "master",
             rank=rank,
@@ -131,6 +139,19 @@ def run_worker(rank, world_size, args):
     else:
         if not IS_SLURM:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
+        if rank == 1:
+            options.set_device_map("master", {0:0})
+        elif rank == 2:
+            options.set_device_map("worker1", {0:0})
+        elif rank == 3:
+            options.set_device_map("worker2", {0:0})
+        elif rank == 4:
+            options.set_device_map("worker3", {0:0})
+        elif rank == 5:
+            options.set_device_map("worker4", {0:0})
+        elif rank == 6:
+            options.set_device_map("worker5", {0:0})
+
         rpc.init_rpc(
             f"worker{rank}",
             rank=rank,

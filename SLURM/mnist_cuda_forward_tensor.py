@@ -3,13 +3,18 @@ import os
 
 import torch
 import torch.distributed.autograd as dist_autograd
+import torch.multiprocessing as mp
 import torch.distributed.rpc as rpc
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributed.optim import DistributedOptimizer
 from torchvision import datasets, transforms
+from tqdm import tqdm
 
-from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device
+from cuda_rpc_forward_tensor import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+
+
+IS_SLURM = os.getenv('SLURM_LOCALID')
 
 
 def run_main():
@@ -26,7 +31,7 @@ def run_main():
     train_dataloader = torch.utils.data.DataLoader(train_data, batch_size=batch_size)
     valid_dataloader = torch.utils.data.DataLoader(valid_data, batch_size=batch_size)
 
-    model = DistributedCPURPCSequential(
+    model = DistributedCUDARPCSequential(
         WorkerModule("worker1", layer_on_device("cuda"), nn.Flatten),
         WorkerModule("worker2", layer_on_device("cuda"), nn.Linear, 28 * 28, 128),
         WorkerModule("worker3", layer_on_device("cuda"), nn.ReLU),
@@ -49,7 +54,9 @@ def run_main():
         epoch_correct = 0
         epoch_all = 0
         for k, dataloader in loaders.items():
-            for i, (x_batch, y_batch) in enumerate(dataloader):
+            for i, (x_batch, y_batch) in enumerate(dataloader if IS_SLURM else tqdm(dataloader)):
+                x_batch = x_batch.to(0)
+                y_batch = y_batch.to(0)
                 if k == "train":
                     model.train()
                     with dist_autograd.context() as context_id:
@@ -72,8 +79,7 @@ def run_main():
                         epoch_correct += correct.item()
                         epoch_all += all
 
-            acc = epoch_correct / epoch_all if epoch_all != 0 else -1
-            print(f"Loader: {k}. Accuracy: {acc}")
+            print(f"Loader: {k}. Accuracy: {epoch_correct / epoch_all}")
 
 
 def run_worker(rank, world_size, args):
@@ -82,6 +88,13 @@ def run_worker(rank, world_size, args):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
 
     if rank == 0:
+        options.set_device_map("worker1", {0: 0})
+        options.set_device_map("worker2", {0: 0})
+        options.set_device_map("worker3", {0: 0})
+        options.set_device_map("worker4", {0: 0})
+        options.set_device_map("worker5", {0: 0})
+        options.set_device_map("worker6", {0: 0})
+
         rpc.init_rpc(
             "master",
             rank=rank,
@@ -90,6 +103,19 @@ def run_worker(rank, world_size, args):
         )
         run_main()
     else:
+        if not IS_SLURM:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
+        if rank == 1:
+            options.set_device_map("worker2", {0: 0})
+        elif rank == 2:
+            options.set_device_map("worker3", {0: 0})
+        elif rank == 3:
+            options.set_device_map("worker4", {0: 0})
+        elif rank == 4:
+            options.set_device_map("worker5", {0: 0})
+        elif rank == 5:
+            options.set_device_map("worker6", {0: 0})
+
         rpc.init_rpc(
             f"worker{rank}",
             rank=rank,
@@ -103,7 +129,7 @@ def run_worker(rank, world_size, args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Pipeline experiments')
 
-    parser.add_argument('--world_size', type=int, default=None,
+    parser.add_argument('--world_size', type=int, default=7,
                         help='the world size')
     parser.add_argument('--rank', type=int, default=None,
                         help="Global rank of this process. Pass in 0 for master.")
@@ -113,4 +139,7 @@ if __name__ == "__main__":
                         help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
 
     args = parser.parse_args()
-    run_worker(args.rank, args.world_size, args)
+    if not args.rank:
+        mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
+    else:
+        run_worker(args.rank, args.world_size, args)

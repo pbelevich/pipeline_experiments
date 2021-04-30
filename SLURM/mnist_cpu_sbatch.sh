@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=mnist1_cpu_sbatch
+#SBATCH --job-name=mnist_cpu_sbatch
 
 #SBATCH --partition=q2
 
@@ -12,5 +12,4 @@
 
 #SBATCH --time=10:00
 
-srun --label mnist1_cpu.sh
-
+srun --label mnist_cpu.sh

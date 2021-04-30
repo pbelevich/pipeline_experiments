@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=mnist1_cuda_sbatch
+#SBATCH --job-name=resnet_cuda_forward_rref_sbatch
 
 #SBATCH --partition=q2
 
@@ -12,4 +12,4 @@
 
 #SBATCH --time=10:00
 
-srun --label mnist1_cuda.sh
+srun --label resnet_cuda_forward_rref.sh

@@ -1,6 +1,6 @@
 #!/bin/bash
 
-#SBATCH --job-name=resnet_cuda_sbatch
+#SBATCH --job-name=mnist_cuda_forward_rref_sbatch
 
 #SBATCH --partition=q2
 
@@ -10,7 +10,6 @@
 
 #SBATCH --gpus-per-task=1
 
-#SBATCH --time=60:00
+#SBATCH --time=10:00
 
-srun --label resnet_cuda.sh
-
+srun --label mnist_cuda_forward_rref.sh

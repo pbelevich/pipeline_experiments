@@ -1,11 +1,11 @@
 #!/bin/bash
 
 srun --label \
-	--job-name=mnist1_cpu_interactive \
+	--job-name=resnet_cuda_forward_rref_interactive \
 	--ntasks=8 \
 	--partition=q2 \
 	--nodes=4 \
 	--gpus-per-node=2 \
 	--gpus-per-task=1 \
 	--time=10:00 \
-	mnist1_cpu.sh
+	resnet_cuda_forward_rref.sh
