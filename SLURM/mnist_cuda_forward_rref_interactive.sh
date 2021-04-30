@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export USE_TQDM = 1
+export USE_TQDM=1
 
 srun --label \
 	--job-name=mnist_cuda_forward_rref_interactive \

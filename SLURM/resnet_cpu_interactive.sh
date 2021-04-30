@@ -1,6 +1,6 @@
 #!/bin/bash
 
-export USE_TQDM = 1
+export USE_TQDM=1
 
 srun --label \
 	--job-name=resnet_cpu_interactive \
