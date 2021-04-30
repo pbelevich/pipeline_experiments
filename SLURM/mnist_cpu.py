@@ -120,7 +120,7 @@ if __name__ == "__main__":
                         help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
 
     args = parser.parse_args()
-    if not args.rank:
+    if args.rank is None:
         mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
     else:
         run_worker(args.rank, args.world_size, args)
