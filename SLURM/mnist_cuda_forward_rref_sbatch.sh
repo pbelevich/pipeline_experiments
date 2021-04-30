@@ -10,6 +10,6 @@
 
 #SBATCH --gpus-per-task=1
 
-#SBATCH --time=10:00
+#SBATCH --time=30:00
 
 srun --label mnist_cuda_forward_rref.sh

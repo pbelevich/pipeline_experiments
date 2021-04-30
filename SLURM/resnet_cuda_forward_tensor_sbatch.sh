@@ -10,6 +10,6 @@
 
 #SBATCH --gpus-per-task=1
 
-#SBATCH --time=10:00
+#SBATCH --time=1:00:00
 
 srun --label resnet_cuda_forward_tensor.sh

@@ -7,5 +7,5 @@ srun --label \
 	--nodes=4 \
 	--gpus-per-node=2 \
 	--gpus-per-task=1 \
-	--time=10:00 \
+	--time=1:00:00 \
 	resnet_cpu.sh
