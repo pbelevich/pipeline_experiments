@@ -86,7 +86,7 @@ def get_my_gpu_index():
 def count_model_param(nn_model):
     model_parameters = filter(lambda p: p.requires_grad, nn_model.parameters())
     params = sum([torch.prod(torch.tensor(p.size())) for p in model_parameters])
-    return params.item()
+    return int(params)
 
 
 class _layer_on_device_helper():

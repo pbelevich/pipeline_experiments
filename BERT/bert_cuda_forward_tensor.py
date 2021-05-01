@@ -147,11 +147,8 @@ def run_main(args):
 
     model = DistributedCUDARPCSequential(
         WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
-        WorkerModule("worker2", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker3", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker4", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker5", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker6", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
+        *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (args.world_size - 3), args.dropout) for i in range(2, args.world_size-1)),
+        WorkerModule(f"worker{args.world_size-1}", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
     )
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
@@ -180,12 +177,8 @@ def run_worker(rank, world_size, args):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=300)
 
     if rank == 0:
-        options.set_device_map("worker1", {0: 0})
-        options.set_device_map("worker2", {0: 0})
-        options.set_device_map("worker3", {0: 0})
-        options.set_device_map("worker4", {0: 0})
-        options.set_device_map("worker5", {0: 0})
-        options.set_device_map("worker6", {0: 0})
+        for i in range(1, world_size):
+            options.set_device_map(f"worker{i}", {0: 0})
 
         rpc.init_rpc(
             "master",
@@ -197,16 +190,9 @@ def run_worker(rank, world_size, args):
     else:
         if not IS_SLURM:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
-        if rank == 1:
-            options.set_device_map("worker2", {0: 0})
-        elif rank == 2:
-            options.set_device_map("worker3", {0: 0})
-        elif rank == 3:
-            options.set_device_map("worker4", {0: 0})
-        elif rank == 4:
-            options.set_device_map("worker5", {0: 0})
-        elif rank == 5:
-            options.set_device_map("worker6", {0: 0})
+
+        if rank < world_size - 1:
+            options.set_device_map(f"worker{rank + 1}", {0: 0})
 
         rpc.init_rpc(
             f"worker{rank}",
@@ -256,7 +242,7 @@ if __name__ == "__main__":
                         help='dataset used for MLM task')
     # parser.add_argument('--parallel', type=str, default='None',
     #                     help='Use DataParallel to train model')
-    parser.add_argument('--world_size', type=int, default=7,
+    parser.add_argument('--world_size', type=int, default=15,
                         help='the world size to initiate DPP')
     parser.add_argument('--rank', type=int, default=None,
                         help="Global rank of this process. Pass in 0 for master.")
@@ -273,4 +259,7 @@ if __name__ == "__main__":
     if args.rank is None:
         mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
     else:
-        run_worker(args.rank, args.world_size, args)
+        args.world_size -= 1
+        if args.rank < args.world_size:
+            run_worker(args.rank, args.world_size, args)
+
