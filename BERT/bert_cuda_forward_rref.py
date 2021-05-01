@@ -3,19 +3,24 @@ import math
 import sys
 import time
 import os
+import socket
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.multiprocessing as mp
 import torch.distributed.rpc as rpc
 from torch.distributed.optim import DistributedOptimizer
 import torch.distributed.autograd as dist_autograd
 
 from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
 from utils import run_demo, run_ddp, wrap_up
-from sharder import MLMTaskSharder
-from cpu_rpc import DistributedCPURPCSequential, WorkerModule, layer_on_device, pipeline_on_devices
+from cuda_rpc_forward_rref import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+
+
+IS_SLURM = os.getenv('SLURM_LOCALID')
+USE_TQDM = os.getenv('USE_TQDM', True if not IS_SLURM else False)
 
 
 def collate_batch(batch_data, args, mask_id, cls_id):
@@ -52,6 +57,8 @@ def train(model, vocab, train_loss_log, train_data,
                             shuffle=False, collate_fn=lambda b: collate_batch(b, args, mask_id, cls_id))
 
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
+        data = data.to(0)
+        targets = targets.to(0)
         with dist_autograd.context() as context_id:
             data = data.transpose(0, 1)
             output = model(data)
@@ -138,30 +145,13 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
-    # model = DistributedCPURPCSequential(
-    #     WorkerModule("worker1", layer_on_device("cuda:0"), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout)
-    # )
-
-    # model = DistributedCPURPCSequential(
-    #     WorkerModule("worker1", layer_on_device("cuda:0"), MLMTaskEmbedding, ntokens, args.emsize),
-    #     WorkerModule("worker2", layer_on_device("cuda:1"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout),
-    #     WorkerModule("worker3", layer_on_device("cuda:2"), MLMTaskHead, ntokens, args.emsize),
-    # )
-
-    # model = DistributedCPURPCSequential(
-    #     WorkerModule("worker1", pipeline_on_devices(0, 1, 2, 3, 4, 5, 6, 7, include_embeddings=True, n_encoders=args.nlayers, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-    # )
-
-    # model = DistributedCPURPCSequential(
-    #     WorkerModule("worker1", pipeline_on_devices(6, 4, 2, 0, include_embeddings=True, n_encoders=args.nlayers // 2), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-    #     WorkerModule("worker2", pipeline_on_devices(1, 3, 5, 7, n_encoders=args.nlayers // 2, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-    # )
-
-    model = DistributedCPURPCSequential(
-        WorkerModule("worker1", pipeline_on_devices(5, 2, include_embeddings=True, n_encoders=args.nlayers // 6, n_encoders_on_last_gpu=args.nlayers // 6), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker2", pipeline_on_devices(0, 7, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker3", pipeline_on_devices(1, 4, n_encoders=args.nlayers // 3), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
-        WorkerModule("worker4", pipeline_on_devices(6, 3, n_encoders=args.nlayers // 6, n_encoders_on_first_gpu=args.nlayers // 6, include_head=True), MLMTaskSharder, ntokens, args.emsize, args.nhead, args.nhid, args.dropout),
+    model = DistributedCUDARPCSequential(
+        WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
+        WorkerModule("worker2", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
+        WorkerModule("worker3", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
+        WorkerModule("worker4", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
+        WorkerModule("worker5", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
+        WorkerModule("worker6", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
     )
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
@@ -183,12 +173,20 @@ def run_main(args):
 
 
 def run_worker(rank, world_size, args):
+    print(f"rank = {rank} host/pid = {socket.gethostname()}/{os.getpid()}")
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=300)
 
     if rank == 0:
+        options.set_device_map("worker1", {0: 0})
+        options.set_device_map("worker2", {0: 0})
+        options.set_device_map("worker3", {0: 0})
+        options.set_device_map("worker4", {0: 0})
+        options.set_device_map("worker5", {0: 0})
+        options.set_device_map("worker6", {0: 0})
+
         rpc.init_rpc(
             "master",
             rank=rank,
@@ -197,6 +195,21 @@ def run_worker(rank, world_size, args):
         )
         run_main(args)
     else:
+        if not IS_SLURM:
+            os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
+        if rank == 1:
+            options.set_device_map("master", {0:0})
+        elif rank == 2:
+            options.set_device_map("worker1", {0:0})
+        elif rank == 3:
+            options.set_device_map("worker2", {0:0})
+        elif rank == 4:
+            options.set_device_map("worker3", {0:0})
+        elif rank == 5:
+            options.set_device_map("worker4", {0:0})
+        elif rank == 6:
+            options.set_device_map("worker5", {0:0})
+
         rpc.init_rpc(
             f"worker{rank}",
             rank=rank,
@@ -245,7 +258,7 @@ if __name__ == "__main__":
                         help='dataset used for MLM task')
     # parser.add_argument('--parallel', type=str, default='None',
     #                     help='Use DataParallel to train model')
-    parser.add_argument('--world_size', type=int, default=8,
+    parser.add_argument('--world_size', type=int, default=7,
                         help='the world size to initiate DPP')
     parser.add_argument('--rank', type=int, default=None,
                         help="Global rank of this process. Pass in 0 for master.")
@@ -256,8 +269,10 @@ if __name__ == "__main__":
     parser.add_argument('--gpus', type=int, default=1,
                         help='number of GPUs per worker node to use')
     parser.add_argument('--rpc', type=str, default='cpu',
-                        help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')    
-    args = parser.parse_args()
+                        help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')
 
-    print(f"rank = {args.rank} pid = {os.getpid()}")
-    run_worker(args.rank, args.world_size, args)
+    args = parser.parse_args()
+    if args.rank is None:
+        mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
+    else:
+        run_worker(args.rank, args.world_size, args)
