@@ -5,7 +5,7 @@ export MASTER_ADDR=$(scontrol show hostname ${SLURM_NODELIST} | head -n 1)
 export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
 
 python -u bert_cuda_forward_tensor.py \
-	--nlayers=48 \
+	--nlayers=96 \
 	--emsize=4096 \
 	--nhid=16384 \
 	--nhead=16 \
@@ -13,3 +13,4 @@ python -u bert_cuda_forward_tensor.py \
         --rank=${SLURM_PROCID} \
         --master_addr=${MASTER_ADDR} \
         --master_port=${MASTER_PORT}
+
