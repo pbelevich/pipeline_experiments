@@ -6,8 +6,8 @@ export CUDA_VISIBLE_DEVICES=${SLURM_LOCALID}
 
 python -u bert_cuda_forward_tensor.py \
 	--nlayers=96 \
-	--emsize=8192 \
-	--nhid=32768 \
+	--emsize=12288 \
+	--nhid=49152 \
 	--nhead=16 \
         --world_size=${SLURM_NTASKS} \
         --rank=${SLURM_PROCID} \
