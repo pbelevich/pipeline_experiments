@@ -145,6 +145,10 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
+    # print(f"args.nlayers = {args.nlayers}")
+    # print(f"args.world_size = {args.world_size}")
+    assert(args.nlayers % (args.world_size - 3) == 0)
+
     model = DistributedCUDARPCSequential(
         WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
         *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (args.world_size - 3), args.dropout) for i in range(2, args.world_size-1)),
@@ -174,7 +178,7 @@ def run_worker(rank, world_size, args):
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=600)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=3600)
 
     if rank == 0:
         for i in range(1, world_size):
