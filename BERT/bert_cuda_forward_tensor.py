@@ -178,7 +178,7 @@ def run_worker(rank, world_size, args):
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=3600)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=10800)
 
     if rank == 0:
         for i in range(1, world_size):
@@ -263,7 +263,7 @@ if __name__ == "__main__":
     if args.rank is None:
         mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
     else:
-        args.world_size -= 1
+        args.world_size -= 5
         if args.rank < args.world_size:
             run_worker(args.rank, args.world_size, args)
 
