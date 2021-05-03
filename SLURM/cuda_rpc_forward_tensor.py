@@ -1,6 +1,7 @@
 import os
 import socket
 import subprocess
+import concurrent.futures
 
 import torch.distributed.rpc as rpc
 import torch.nn as nn
@@ -11,9 +12,15 @@ class DistributedCUDARPCSequential(nn.Module):
     def __init__(self, *worker_layers):
         super().__init__()
         self.worker_layers = worker_layers
-        first = worker_layers[0]
-        self.first_shard = rpc.remote(first.worker, LocalWrapper,
-                                      (worker_layers[1:], first.remote_class_creator, *(first.args)), **(first.kwargs))
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            concurrent.futures.wait([executor.submit(lambda wl: wl.materialize(), wl) for wl in self.worker_layers])
+
+        for i in range(len(self.worker_layers) - 1):
+            self.worker_layers[i].remote_module.rpc_sync().set_next_shard(self.worker_layers[i + 1].remote_module)
+
+        self.first_shard = self.worker_layers[0].remote_module
+
 
     def forward(self, x):
         x = self.first_shard.remote().forward(x)
@@ -37,19 +44,20 @@ class WorkerModule():
         self.remote_class_creator = remote_class_creator
         self.args = args
         self.kwargs = kwargs
+        self.remote_module = None
+
+    def materialize(self):
+        self.remote_module = rpc.remote(self.worker, LocalWrapper, args=(self.remote_class_creator, *(self.args)), kwargs=self.kwargs)
 
 
 class LocalWrapper(nn.Module):
-    def __init__(self, worker_layers, local_net_creator, *args, **kwargs):
+    def __init__(self, local_net_creator, *args, **kwargs):
         super().__init__()
         self.local_net = local_net_creator(*args, **kwargs)
-        if worker_layers is None or len(worker_layers) == 0:
-            self.next_shard = None
-        else:
-            first = worker_layers[0]
-            self.next_shard = rpc.remote(first.worker, LocalWrapper,
-                                         (worker_layers[1:], first.remote_class_creator, *(first.args)),
-                                         **(first.kwargs))
+        self.next_shard = None
+
+    def set_next_shard(self, next_shard):
+        self.next_shard = next_shard
 
     def train(self, mode=True):
         self.local_net.train(mode=mode)
