@@ -13,7 +13,7 @@ class DistributedCUDARPCSequential(nn.Module):
         self.worker_layers = worker_layers
 
     def forward(self, x):  # x is cpu tensor on master
-        x_rref = RRef(x, devices=[0])  # x_rref is initially on master cpu
+        x_rref = RRef(x)  # x_rref is initially on master cpu
         for worker_layer in self.worker_layers:
             x_rref = worker_layer(x_rref)  # pass to worker layer
         return x_rref.to_here()  # get x to master cpu
@@ -62,20 +62,14 @@ class LocalWrapper(nn.Module):
         return self.local_net(x)
 
     def parameter_rrefs(self):
-        return [RRef(p, devices=[0]) for p in self.local_net.parameters()]
+        return [RRef(p) for p in self.local_net.parameters()]
 
 
 def get_my_gpu_index():
     try:
         return int(os.getenv("CUDA_VISIBLE_DEVICES"))
     except:
-        try:
-            p1 = subprocess.Popen(["nvidia-smi"], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen(["grep", str(os.getpid())], stdin=p1.stdout, stdout=subprocess.PIPE)
-            p3 = subprocess.Popen(["awk", "{print $2}"], stdin=p2.stdout, stdout=subprocess.PIPE)
-            return int(p3.communicate()[0])
-        except:
-            return None
+        None
 
 
 class _layer_on_device_helper():
@@ -90,17 +84,3 @@ class _layer_on_device_helper():
 
 def layer_on_device(device):
     return _layer_on_device_helper(device)
-
-
-class _pipeline_on_devices_helper():
-    def __init__(self, *devices, **config):
-        self.devices = devices
-        self.device = devices[0]
-        self.config = config
-
-    def __call__(self, pipeline_class, *args, **kwargs):
-        return pipeline_class(self.devices, self.config, *args, **kwargs)
-
-
-def pipeline_on_devices(*devices, **kwargs):
-    return _pipeline_on_devices_helper(*devices, **kwargs)
