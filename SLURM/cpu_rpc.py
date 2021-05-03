@@ -1,6 +1,7 @@
 import os
 import socket
 import subprocess
+import concurrent.futures
 
 import torch.distributed.rpc as rpc
 import torch.nn as nn
@@ -11,6 +12,8 @@ class DistributedCPURPCSequential(nn.Module):
     def __init__(self, *worker_layers):
         super().__init__()
         self.worker_layers = worker_layers
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            concurrent.futures.wait([executor.submit(lambda wl: wl.materialize(), wl) for wl in self.worker_layers])
 
     def forward(self, x):  # x is cpu tensor on master
         x_rref = RRef(x)  # x_rref is initially on master cpu
@@ -35,7 +38,14 @@ class DistributedCPURPCSequential(nn.Module):
 class WorkerModule(nn.Module):
     def __init__(self, worker, remote_class_creator, *args, **kwargs):
         super().__init__()
-        self.remote_module = rpc.remote(worker, LocalWrapper, (remote_class_creator, *args), kwargs)
+        self.worker = worker
+        self.remote_class_creator = remote_class_creator
+        self.args = args
+        self.kwargs = kwargs
+        self.remote_module = None
+
+    def materialize(self):
+        self.remote_module = rpc.remote(self.worker, LocalWrapper, args=(self.remote_class_creator, *(self.args)), kwargs=self.kwargs)
 
     def train(self, mode=True):
         self.remote_module.rpc_sync().train(mode=mode)
