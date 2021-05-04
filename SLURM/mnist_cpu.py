@@ -39,6 +39,7 @@ def run_main():
         WorkerModule("worker4", layer_on_device("cuda"), nn.Linear, 128, 64),
         WorkerModule("worker5", layer_on_device("cuda"), nn.ReLU),
         WorkerModule("worker6", layer_on_device("cuda"), nn.Linear, 64, 10),
+        microbatch_size=batch_size // 4
     )
 
     criterion = nn.CrossEntropyLoss()
