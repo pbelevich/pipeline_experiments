@@ -2,7 +2,9 @@ import os
 import socket
 import subprocess
 import concurrent.futures
+import threading
 
+import torch
 import torch.distributed.rpc as rpc
 import torch.nn as nn
 from torch.distributed.rpc import RRef
@@ -20,7 +22,6 @@ class DistributedCUDARPCSequential(nn.Module):
             self.worker_layers[i].remote_module.rpc_sync().set_next_shard(self.worker_layers[i + 1].remote_module)
 
         self.first_shard = self.worker_layers[0].remote_module
-
 
     def forward(self, x):
         x = self.first_shard.remote().forward(x)
@@ -55,6 +56,7 @@ class LocalWrapper(nn.Module):
         super().__init__()
         self.local_net = local_net_creator(*args, **kwargs)
         self.next_shard = None
+        self._lock = threading.Lock()
 
     def set_next_shard(self, next_shard):
         self.next_shard = next_shard
@@ -65,7 +67,8 @@ class LocalWrapper(nn.Module):
             self.next_shard.rpc_sync().train(mode=mode)
 
     def forward(self, x):
-        x = self.local_net(x)
+        with self._lock:
+            x = self.local_net(x)
         if self.next_shard is not None:
             return self.next_shard.remote().forward(x)
         return x
