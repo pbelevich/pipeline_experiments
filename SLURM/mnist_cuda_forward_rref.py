@@ -19,7 +19,7 @@ USE_TQDM = os.getenv('USE_TQDM', True if not IS_SLURM else False)
 
 
 def run_main():
-    batch_size = 400
+    batch_size = 100
 
     transform = transforms.Compose([
         transforms.ToTensor(),

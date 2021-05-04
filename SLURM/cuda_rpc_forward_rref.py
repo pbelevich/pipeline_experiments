@@ -25,14 +25,6 @@ class DistributedCUDARPCSequential(nn.Module):
                 x_rref = worker_layer(x_rref)  # pass to worker layer
             return x_rref.to_here()  # get x to master cpu
         else:
-            # x_rrefs = []
-            # for x in iter(xs.split(self.microbatch_size, dim=0)):
-            #     x_rref = RRef(x)
-            #     for worker_layer in self.worker_layers:
-            #         x_rref = worker_layer(x_rref)
-            #     x_rrefs.append(x_rref)
-            # return torch.cat([x_rref.to_here() for x_rref in x_rrefs])
-
             out_futures = []
             for x in iter(xs.split(self.microbatch_size, dim=0)):
                 x_rref = RRef(x)

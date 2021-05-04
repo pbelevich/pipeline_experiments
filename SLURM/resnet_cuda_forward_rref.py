@@ -53,7 +53,7 @@ def layer5():
 
 
 def run_main():
-    batch_size = 400
+    batch_size = 100
 
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -73,7 +73,7 @@ def run_main():
         WorkerModule("worker4", layer_on_device("cuda"), layer3),
         WorkerModule("worker5", layer_on_device("cuda"), layer4),
         WorkerModule("worker6", layer_on_device("cuda"), layer5),
-        microbatch_size=batch_size // 4
+        # microbatch_size=batch_size // 4
     )
 
     criterion = nn.CrossEntropyLoss()
