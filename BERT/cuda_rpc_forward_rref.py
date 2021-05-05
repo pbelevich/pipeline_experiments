@@ -10,7 +10,7 @@ import torch.nn as nn
 from torch.distributed.rpc import RRef
 
 
-class DistributedCPURPCSequential(nn.Module):
+class DistributedCUDARPCSequential(nn.Module):
     def __init__(self, *worker_layers, microbatch_size=None):
         super().__init__()
         self.worker_layers = worker_layers
@@ -82,10 +82,10 @@ class LocalWrapper(nn.Module):
         self.local_net.train(mode=mode)
 
     def forward(self, x_rref):
-        x = x_rref.to_here().to(self.first_device)
+        x = x_rref.to_here()
         with self._lock:
             res = self.local_net(x)
-        return res.cpu()
+        return res
 
     def parameter_rrefs(self):
         return [RRef(p) for p in self.local_net.parameters()]
