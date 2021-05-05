@@ -145,17 +145,16 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
+    assert(args.nlayers % (args.world_size - 3) == 0)
+
     model = DistributedCUDARPCSequential(
         WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
-        WorkerModule("worker2", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker3", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker4", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker5", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // 4, args.dropout),
-        WorkerModule("worker6", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
+        *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (args.world_size - 3), args.dropout) for i in range(2, args.world_size-1)),
+        WorkerModule(f"worker{args.world_size-1}", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
     )
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
-    print(f'Total parameters = {int(params.item() // 1e6)}M')
+    print(f'Total parameters = {params.item() // 10**6}M')
 
     criterion = nn.CrossEntropyLoss()
     optimizer = DistributedOptimizer(
@@ -177,15 +176,11 @@ def run_worker(rank, world_size, args):
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = args.master_addr
     os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=300)
+    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=10800)
 
     if rank == 0:
-        options.set_device_map("worker1", {0: 0})
-        options.set_device_map("worker2", {0: 0})
-        options.set_device_map("worker3", {0: 0})
-        options.set_device_map("worker4", {0: 0})
-        options.set_device_map("worker5", {0: 0})
-        options.set_device_map("worker6", {0: 0})
+        for i in range(1, world_size):
+            options.set_device_map(f"worker{i}", {0: 0})
 
         rpc.init_rpc(
             "master",
@@ -197,18 +192,8 @@ def run_worker(rank, world_size, args):
     else:
         if not IS_SLURM:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
-        if rank == 1:
-            options.set_device_map("master", {0:0})
-        elif rank == 2:
-            options.set_device_map("worker1", {0:0})
-        elif rank == 3:
-            options.set_device_map("worker2", {0:0})
-        elif rank == 4:
-            options.set_device_map("worker3", {0:0})
-        elif rank == 5:
-            options.set_device_map("worker4", {0:0})
-        elif rank == 6:
-            options.set_device_map("worker5", {0:0})
+
+        options.set_device_map(f"worker{rank - 1}" if rank > 1 else "master", {0: 0})
 
         rpc.init_rpc(
             f"worker{rank}",
@@ -248,16 +233,12 @@ if __name__ == "__main__":
                         help='report interval')
     parser.add_argument('--checkpoint', type=str, default='None',
                         help='path to load the checkpoint')
-    # parser.add_argument('--save', type=str, default='mlm_bert.pt',
-    #                     help='path to save the final model')
     parser.add_argument('--save-vocab', type=str, default='torchtext_bert_vocab.pt',
                         help='path to save the vocab')
     parser.add_argument('--mask_frac', type=float, default=0.15,
                         help='the fraction of masked tokens')
     parser.add_argument('--dataset', type=str, default='WikiText2',
                         help='dataset used for MLM task')
-    # parser.add_argument('--parallel', type=str, default='None',
-    #                     help='Use DataParallel to train model')
     parser.add_argument('--world_size', type=int, default=7,
                         help='the world size to initiate DPP')
     parser.add_argument('--rank', type=int, default=None,
@@ -274,5 +255,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     if args.rank is None:
         mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
-    else:
+    elif args.rank < args.world_size:
         run_worker(args.rank, args.world_size, args)
+    else:
+        print("I'm unused, exiting")

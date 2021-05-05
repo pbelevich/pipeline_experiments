@@ -1,6 +1,8 @@
 import os
 import socket
 import subprocess
+import concurrent.futures
+import threading
 
 import torch
 import torch.distributed.rpc as rpc
@@ -12,9 +14,14 @@ class DistributedCUDARPCSequential(nn.Module):
     def __init__(self, *worker_layers):
         super().__init__()
         self.worker_layers = worker_layers
-        first = worker_layers[0]
-        self.first_shard = rpc.remote(first.worker, LocalWrapper,
-                                      (worker_layers[1:], first.remote_class_creator, *(first.args)), **(first.kwargs))
+
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            concurrent.futures.wait([executor.submit(lambda wl: wl.materialize(), wl) for wl in self.worker_layers])
+
+        for i in range(len(self.worker_layers) - 1):
+            self.worker_layers[i].remote_module.rpc_sync().set_next_shard(self.worker_layers[i + 1].remote_module)
+
+        self.first_shard = self.worker_layers[0].remote_module
 
     def forward(self, x):
         x = self.first_shard.remote().forward(x)
@@ -38,19 +45,21 @@ class WorkerModule():
         self.remote_class_creator = remote_class_creator
         self.args = args
         self.kwargs = kwargs
+        self.remote_module = None
+
+    def materialize(self):
+        self.remote_module = rpc.remote(self.worker, LocalWrapper, args=(self.remote_class_creator, *(self.args)), kwargs=self.kwargs)
 
 
 class LocalWrapper(nn.Module):
-    def __init__(self, worker_layers, local_net_creator, *args, **kwargs):
+    def __init__(self, local_net_creator, *args, **kwargs):
         super().__init__()
         self.local_net = local_net_creator(*args, **kwargs)
-        if worker_layers is None or len(worker_layers) == 0:
-            self.next_shard = None
-        else:
-            first = worker_layers[0]
-            self.next_shard = rpc.remote(first.worker, LocalWrapper,
-                                         (worker_layers[1:], first.remote_class_creator, *(first.args)),
-                                         **(first.kwargs))
+        self.next_shard = None
+        self._lock = threading.Lock()
+
+    def set_next_shard(self, next_shard):
+        self.next_shard = next_shard
 
     def train(self, mode=True):
         self.local_net.train(mode=mode)
@@ -58,7 +67,8 @@ class LocalWrapper(nn.Module):
             self.next_shard.rpc_sync().train(mode=mode)
 
     def forward(self, x):
-        x = self.local_net(x)
+        with self._lock:
+            x = self.local_net(x)
         if self.next_shard is not None:
             return self.next_shard.remote().forward(x)
         return x
@@ -74,19 +84,11 @@ def get_my_gpu_index():
     try:
         return int(os.getenv("CUDA_VISIBLE_DEVICES"))
     except:
-        try:
-            p1 = subprocess.Popen(["nvidia-smi"], stdout=subprocess.PIPE)
-            p2 = subprocess.Popen(["grep", str(os.getpid())], stdin=p1.stdout, stdout=subprocess.PIPE)
-            p3 = subprocess.Popen(["awk", "{print $2}"], stdin=p2.stdout, stdout=subprocess.PIPE)
-            return int(p3.communicate()[0])
-        except:
-            return None
+        return None
 
 
-def count_model_param(nn_model):
-    model_parameters = filter(lambda p: p.requires_grad, nn_model.parameters())
-    params = sum([torch.prod(torch.tensor(p.size())) for p in model_parameters])
-    return params.item()
+def count_model_param(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
 class _layer_on_device_helper():
@@ -95,23 +97,9 @@ class _layer_on_device_helper():
 
     def __call__(self, layer_class, *args, **kwargs):
         res = layer_class(*args, **kwargs).to(self.device)
-        print(f"Materializing {layer_class} with {count_model_param(res) // 1e6}M params on {socket.gethostname()}:{get_my_gpu_index()}")
+        print(f"Materializing {layer_class} with {count_model_param(res) // 10**6}M params on {socket.gethostname()}:{get_my_gpu_index()}")
         return res
 
 
 def layer_on_device(device):
     return _layer_on_device_helper(device)
-
-
-class _pipeline_on_devices_helper():
-    def __init__(self, *devices, **config):
-        self.devices = devices
-        self.device = devices[0]
-        self.config = config
-
-    def __call__(self, pipeline_class, *args, **kwargs):
-        return pipeline_class(self.devices, self.config, *args, **kwargs)
-
-
-def pipeline_on_devices(*devices, **kwargs):
-    return _pipeline_on_devices_helper(*devices, **kwargs)
