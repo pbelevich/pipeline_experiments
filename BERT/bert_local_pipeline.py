@@ -7,17 +7,11 @@ import socket
 import statistics
 
 import torch
-import torch.distributed as dist
 import torch.nn as nn
 from torch.utils.data import DataLoader
-import torch.multiprocessing as mp
-import torch.distributed.rpc as rpc
-from torch.distributed.optim import DistributedOptimizer
-import torch.distributed.autograd as dist_autograd
 
 from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
-from utils import run_demo, run_ddp, wrap_up
-from cuda_rpc_forward_rref import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+from cuda_local_pipeline import LocalSequential
 
 
 IS_SLURM = os.getenv('SLURM_LOCALID')
@@ -60,21 +54,21 @@ def train(model, vocab, train_loss_log, train_data,
     forward_elapsed = []
     backward_elapsed = []
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
+        optimizer.zero_grad()
         data = data.to(0)
-        targets = targets.to(0)
-        with dist_autograd.context() as context_id:
-            data = data.transpose(0, 1)
-            forward_start_time = time.time()
-            output = model(data)
-            output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
-            loss = criterion(output.view(-1, ntokens), targets)
-            forward_elapsed.append((time.time() - forward_start_time) * 1000)
-            backward_start_time = time.time()
-            dist_autograd.backward(context_id, [loss])
-            backward_elapsed.append((time.time() - backward_start_time) * 1000)
-            # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-            optimizer.step(context_id)
-            total_loss += loss.item()
+        targets = targets.to(args.gpus - 1)
+        data = data.transpose(0, 1)
+        forward_start_time = time.time()
+        output = model(data)
+        output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
+        loss = criterion(output.view(-1, ntokens), targets)
+        forward_elapsed.append((time.time() - forward_start_time) * 1000)
+        backward_start_time = time.time()
+        loss.backward()
+        backward_elapsed.append((time.time() - backward_start_time) * 1000)
+        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
+        optimizer.step()
+        total_loss += loss.item()
 
         if batch % args.log_interval == 0 and batch > 0:
             cur_loss = total_loss / args.log_interval
@@ -94,22 +88,8 @@ def train(model, vocab, train_loss_log, train_data,
             start_time = time.time()
 
 
-def half1(ntokens, args):
-    return nn.Sequential(
-        MLMTaskEmbedding(ntokens, args.emsize),
-        MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout),
-    )
-            
-
-
-def half2(ntokens, args):
-    return nn.Sequential(
-        MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout),
-        MLMTaskHead(ntokens, args.emsize),
-    )
-
-
 def run_main(args):
+    torch.manual_seed(args.seed)
     import torchtext
     if args.dataset == 'WikiText103':
         from torchtext.experimental.datasets import WikiText103 as WLMDataset
@@ -171,35 +151,33 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
-    nworkers = args.world_size - 1
-    
-    if nworkers == 1:
-        model = DistributedCUDARPCSequential(
-            WorkerModule("worker1", layer_on_device("cuda"), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout),
-        )
-    elif nworkers == 2:
+    if args.gpus == 1:
+        model = MLMTask(ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout).to(0)
+    elif args.gpus == 2:
         assert(args.nlayers % 2 == 0)
-        model = DistributedCUDARPCSequential(
-            WorkerModule("worker1", layer_on_device("cuda"), half1, ntokens, args),
-            WorkerModule("worker2", layer_on_device("cuda"), half2, ntokens, args),
+        model = LocalSequential(
+            nn.Sequential(
+                MLMTaskEmbedding(ntokens, args.emsize).to(0),
+                MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout).to(0),
+            ),
+            nn.Sequential(
+                MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout).to(1),
+                MLMTaskHead(ntokens, args.emsize).to(1),
+            ),
         )
     else:
-        assert(args.nlayers % (nworkers - 2) == 0)
-        model = DistributedCUDARPCSequential(
-            WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
-            *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (nworkers - 2), args.dropout) for i in range(2, args.world_size - 1)),
-            WorkerModule(f"worker{args.world_size-1}", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
+        assert(args.nlayers % (args.gpus - 2) == 0)
+        model = LocalSequential(
+            MLMTaskEmbedding(ntokens, args.emsize).to(0),
+            *(MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // (args.gpus - 2), args.dropout).to(i) for i in range(1, args.gpus - 1)),
+            MLMTaskHead(ntokens, args.emsize).to(args.gpus - 1),
         )
 
-    params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
-    print(f'Total parameters = {params.item() // 10**6}M')
+    params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f'Total parameters = {params // 10**6}M')
 
     criterion = nn.CrossEntropyLoss()
-    optimizer = DistributedOptimizer(
-            torch.optim.SGD,
-            model.parameter_rrefs(),
-            lr=args.lr,
-        )
+    optimizer = torch.optim.SGD(model.parameters(), lr=args.lr)
     best_val_loss = None
     train_loss_log, val_loss_log = [], []
 
@@ -207,40 +185,6 @@ def run_main(args):
         epoch_start_time = time.time()
         train(model, train_dataset.vocab, train_loss_log, train_data,
               optimizer, criterion, ntokens, epoch, args)
-
-
-def run_worker(rank, world_size, args):
-    print(f"rank = {rank} host/pid = {socket.gethostname()}/{os.getpid()}")
-    torch.manual_seed(args.seed)
-    os.environ['MASTER_ADDR'] = args.master_addr
-    os.environ['MASTER_PORT'] = args.master_port
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=10800)
-
-    if rank == 0:
-        for i in range(1, world_size):
-            options.set_device_map(f"worker{i}", {0: 0})
-
-        rpc.init_rpc(
-            "master",
-            rank=rank,
-            world_size=world_size,
-            rpc_backend_options=options
-        )
-        run_main(args)
-    else:
-        if not IS_SLURM:
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
-
-        options.set_device_map(f"worker{rank - 1}" if rank > 1 else "master", {0: 0})
-
-        rpc.init_rpc(
-            f"worker{rank}",
-            rank=rank,
-            world_size=world_size,
-            rpc_backend_options=options
-        )
-    
-    rpc.shutdown()
 
 
 if __name__ == "__main__":
@@ -275,19 +219,8 @@ if __name__ == "__main__":
                         help='the fraction of masked tokens')
     parser.add_argument('--dataset', type=str, default='WikiText2',
                         help='dataset used for MLM task')
-    parser.add_argument('--world_size', type=int, default=7,
-                        help='the world size to initiate DPP')
-    parser.add_argument('--rank', type=int, default=None,
-                        help="Global rank of this process. Pass in 0 for master.")
-    parser.add_argument('--master_addr', type=str, default='localhost',
-                        help="""Address of master, will default to localhost if not provided. Master must be able to accept network traffic on the address + port.""")
-    parser.add_argument('--master_port', type=str, default='29500',
-                        help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
+    parser.add_argument('--gpus', type=int, default=8,
+                        help='number of GPUs per worker node to use')
 
     args = parser.parse_args()
-    if args.rank is None:
-        mp.spawn(run_worker, args=(args.world_size, args,), nprocs=args.world_size, join=True)
-    elif args.rank < args.world_size:
-        run_worker(args.rank, args.world_size, args)
-    else:
-        print("I'm unused, exiting")
+    run_main(args)
