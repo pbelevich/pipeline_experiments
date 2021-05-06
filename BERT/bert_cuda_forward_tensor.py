@@ -4,6 +4,7 @@ import sys
 import time
 import os
 import socket
+import statistics
 
 import torch
 import torch.distributed as dist
@@ -56,15 +57,21 @@ def train(model, vocab, train_loss_log, train_data,
     dataloader = DataLoader(train_data, batch_size=args.batch_size * args.bptt,
                             shuffle=False, collate_fn=lambda b: collate_batch(b, args, mask_id, cls_id))
 
+    forward_elapsed = []
+    backward_elapsed = []
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
         data = data.to(0)
         targets = targets.to(0)
         with dist_autograd.context() as context_id:
             data = data.transpose(0, 1)
+            forward_start_time = time.time()
             output = model(data)
             output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
             loss = criterion(output.view(-1, ntokens), targets)
+            forward_elapsed.append((time.time() - forward_start_time) * 1000)
+            backward_start_time = time.time()
             dist_autograd.backward(context_id, [loss])
+            backward_elapsed.append((time.time() - backward_start_time) * 1000)
             # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             optimizer.step(context_id)
             total_loss += loss.item()
@@ -73,14 +80,33 @@ def train(model, vocab, train_loss_log, train_data,
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f} | backward {:5.2f}±{:5.2f} | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(epoch, batch,
                                                         len(train_data) // (args.bptt * args.batch_size),
                                                         args.lr,
                                                         elapsed * 1000 / args.log_interval,
+                                                        statistics.mean(forward_elapsed),
+                                                        statistics.stdev(forward_elapsed),
+                                                        statistics.mean(backward_elapsed),
+                                                        statistics.stdev(backward_elapsed),
                                                         cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
+
+
+def half1(ntokens, args):
+    return nn.Sequential(
+        MLMTaskEmbedding(ntokens, args.emsize),
+        MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout),
+    )
+            
+
+
+def half2(ntokens, args):
+    return nn.Sequential(
+        MLMTaskEncoder(args.emsize, args.nhead, args.nhid, args.nlayers // 2, args.dropout),
+        MLMTaskHead(ntokens, args.emsize),
+    )
 
 
 def run_main(args):
@@ -145,13 +171,25 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
-    assert(args.nlayers % (args.world_size - 3) == 0)
-
-    model = DistributedCUDARPCSequential(
-        WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
-        *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (args.world_size - 3), args.dropout) for i in range(2, args.world_size-1)),
-        WorkerModule(f"worker{args.world_size-1}", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
-    )
+    nworkers = args.world_size - 1
+    
+    if nworkers == 1:
+        model = DistributedCUDARPCSequential(
+            WorkerModule("worker1", layer_on_device("cuda"), MLMTask, ntokens, args.emsize, args.nhead, args.nhid, args.nlayers, args.dropout),
+        )
+    elif nworkers == 2:
+        assert(args.nlayers % 2 == 0)
+        model = DistributedCUDARPCSequential(
+            WorkerModule("worker1", layer_on_device("cuda"), half1, ntokens, args),
+            WorkerModule("worker2", layer_on_device("cuda"), half2, ntokens, args),
+        )
+    else:
+        assert(args.nlayers % (nworkers - 2) == 0)
+        model = DistributedCUDARPCSequential(
+            WorkerModule("worker1", layer_on_device("cuda"), MLMTaskEmbedding, ntokens, args.emsize),
+            *(WorkerModule(f"worker{i}", layer_on_device("cuda"), MLMTaskEncoder, args.emsize, args.nhead, args.nhid, args.nlayers // (nworkers - 2), args.dropout) for i in range(2, args.world_size - 1)),
+            WorkerModule(f"worker{args.world_size-1}", layer_on_device("cuda"), MLMTaskHead, ntokens, args.emsize),
+        )
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
     print(f'Total parameters = {params.item() // 10**6}M')
@@ -231,8 +269,6 @@ if __name__ == "__main__":
                         help='random seed')
     parser.add_argument('--log-interval', type=int, default=10, metavar='N',
                         help='report interval')
-    parser.add_argument('--checkpoint', type=str, default='None',
-                        help='path to load the checkpoint')
     parser.add_argument('--save-vocab', type=str, default='torchtext_bert_vocab.pt',
                         help='path to save the vocab')
     parser.add_argument('--mask_frac', type=float, default=0.15,
@@ -247,10 +283,6 @@ if __name__ == "__main__":
                         help="""Address of master, will default to localhost if not provided. Master must be able to accept network traffic on the address + port.""")
     parser.add_argument('--master_port', type=str, default='29500',
                         help="""Port that master is listening on, will default to 29500 if not provided. Master must be able to accept network traffic on the host and port.""")
-    parser.add_argument('--gpus', type=int, default=1,
-                        help='number of GPUs per worker node to use')
-    parser.add_argument('--rpc', type=str, default='cpu',
-                        help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')
 
     args = parser.parse_args()
     if args.rank is None:
