@@ -98,13 +98,17 @@ def get_my_gpu_index():
         None
 
 
+def count_model_param(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 class _layer_on_device_helper():
     def __init__(self, device):
         self.device = device
 
     def __call__(self, layer_class, *args, **kwargs):
         res = layer_class(*args, **kwargs).to(self.device)
-        print(f"Materializing {layer_class} on {socket.gethostname()}:{get_my_gpu_index()}")
+        print(f"Materializing {layer_class} with {count_model_param(res) // 10**6}M params on {socket.gethostname()}:{get_my_gpu_index()}")
         return res
 
 

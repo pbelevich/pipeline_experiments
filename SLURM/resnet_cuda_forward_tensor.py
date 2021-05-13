@@ -138,7 +138,7 @@ def run_worker(rank, world_size, args):
         )
         run_main()
     else:
-        if not IS_SLURM:
+        if args.rank is None:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
         if rank == 1:
             options.set_device_map("worker2", {0: 0})
