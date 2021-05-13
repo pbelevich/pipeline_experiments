@@ -103,3 +103,17 @@ class _layer_on_device_helper():
 
 def layer_on_device(device):
     return _layer_on_device_helper(device)
+
+
+# assuming CUDA_VISIBLE_DEVICES are configured in a way that each process only sees
+# an exclusive set of device
+def sync_all_device():
+  for d in range(torch.cuda.device_count()):
+    torch.cuda.synchronize(d)
+
+
+def global_sync(world_size):
+    futs = []
+    for i in range(world_size):
+        futs.append(rpc.rpc_async(i, sync_all_device))
+    torch.futures.wait_all(futs)
