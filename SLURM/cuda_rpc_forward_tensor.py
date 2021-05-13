@@ -87,15 +87,33 @@ def get_my_gpu_index():
         return None
 
 
+def count_model_param(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
 class _layer_on_device_helper():
     def __init__(self, device):
         self.device = device
 
     def __call__(self, layer_class, *args, **kwargs):
         res = layer_class(*args, **kwargs).to(self.device)
-        print(f"Materializing {layer_class} on {socket.gethostname()}:{get_my_gpu_index()}")
+        print(f"Materializing {layer_class} with {count_model_param(res) // 10**6}M params on {socket.gethostname()}:{get_my_gpu_index()}")
         return res
 
 
 def layer_on_device(device):
     return _layer_on_device_helper(device)
+
+
+# assuming CUDA_VISIBLE_DEVICES are configured in a way that each process only sees
+# an exclusive set of device
+def sync_all_device():
+  for d in range(torch.cuda.device_count()):
+    torch.cuda.synchronize(d)
+
+
+def global_sync(world_size):
+    futs = []
+    for i in range(world_size):
+        futs.append(rpc.rpc_async(i, sync_all_device))
+    torch.futures.wait_all(futs)
