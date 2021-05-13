@@ -75,19 +75,25 @@ def train(model, vocab, train_loss_log, train_data,
             optimizer.step(context_id)
             total_loss += loss.item()
 
-        if batch % args.log_interval == 0 and batch > 0:
+        if batch % args.log_interval == 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f} | backward {:5.2f}±{:5.2f} | '
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | backward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(epoch, batch,
                                                         len(train_data) // (args.bptt * args.batch_size),
                                                         args.lr,
                                                         elapsed * 1000 / args.log_interval,
                                                         statistics.mean(forward_elapsed),
-                                                        statistics.stdev(forward_elapsed),
+                                                        statistics.stdev(forward_elapsed) if len(forward_elapsed) > 1 else 0.0,
+                                                        forward_elapsed[-1],
+                                                        min(forward_elapsed),
+                                                        max(forward_elapsed),
                                                         statistics.mean(backward_elapsed),
-                                                        statistics.stdev(backward_elapsed),
+                                                        statistics.stdev(backward_elapsed) if len(backward_elapsed) > 1 else 0.0,
+                                                        backward_elapsed[-1],
+                                                        min(backward_elapsed),
+                                                        max(backward_elapsed),
                                                         cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
