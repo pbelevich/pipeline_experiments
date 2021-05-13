@@ -17,7 +17,7 @@ import torch.distributed.autograd as dist_autograd
 
 from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
 from utils import run_demo, run_ddp, wrap_up
-from cuda_rpc_forward_rref import DistributedCUDARPCSequential, WorkerModule, layer_on_device
+from cuda_rpc_forward_rref import DistributedCUDARPCSequential, WorkerModule, layer_on_device, global_sync
 
 
 IS_SLURM = os.getenv('SLURM_LOCALID')
@@ -64,31 +64,40 @@ def train(model, vocab, train_loss_log, train_data,
         targets = targets.to(0)
         with dist_autograd.context() as context_id:
             data = data.transpose(0, 1)
+            global_sync(args.world_size)
             forward_start_time = time.time()
             output = model(data)
             output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
             loss = criterion(output.view(-1, ntokens), targets)
+            global_sync(args.world_size)
             forward_elapsed.append((time.time() - forward_start_time) * 1000)
             backward_start_time = time.time()
             dist_autograd.backward(context_id, [loss])
+            global_sync(args.world_size)
             backward_elapsed.append((time.time() - backward_start_time) * 1000)
             # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
             optimizer.step(context_id)
             total_loss += loss.item()
 
-        if batch % args.log_interval == 0 and batch > 0:
+        if batch % args.log_interval == 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f} | backward {:5.2f}±{:5.2f} | '
+            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | backward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | '
                     'loss {:5.2f} | ppl {:8.2f}'.format(epoch, batch,
                                                         len(train_data) // (args.bptt * args.batch_size),
                                                         args.lr,
                                                         elapsed * 1000 / args.log_interval,
                                                         statistics.mean(forward_elapsed),
-                                                        statistics.stdev(forward_elapsed),
+                                                        statistics.stdev(forward_elapsed) if len(forward_elapsed) > 1 else 0.0,
+                                                        forward_elapsed[-1],
+                                                        min(forward_elapsed),
+                                                        max(forward_elapsed),
                                                         statistics.mean(backward_elapsed),
-                                                        statistics.stdev(backward_elapsed),
+                                                        statistics.stdev(backward_elapsed) if len(backward_elapsed) > 1 else 0.0,
+                                                        backward_elapsed[-1],
+                                                        min(backward_elapsed),
+                                                        max(backward_elapsed),
                                                         cur_loss, math.exp(cur_loss)))
             total_loss = 0
             start_time = time.time()
