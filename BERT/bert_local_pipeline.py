@@ -11,7 +11,7 @@ import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
-from cuda_local_pipeline import LocalSequential
+from cuda_local_pipeline import LocalSequential, sync_all_device
 
 
 IS_SLURM = os.getenv('SLURM_LOCALID')
@@ -51,45 +51,86 @@ def train(model, vocab, train_loss_log, train_data,
     dataloader = DataLoader(train_data, batch_size=args.batch_size * args.bptt,
                             shuffle=False, collate_fn=lambda b: collate_batch(b, args, mask_id, cls_id))
 
-    forward_elapsed = []
-    backward_elapsed = []
+    forward_pyth_elapsed = []
+    forward_cuda_elapsed = []
+    backward_pyth_elapsed = []
+    backward_cuda_elapsed = []
+
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
         optimizer.zero_grad()
         data = data.to(0)
         targets = targets.to(args.gpus - 1)
         data = data.transpose(0, 1)
+
+        fwd_tik = torch.cuda.Event(enable_timing=True)
+        fwd_tok = torch.cuda.Event(enable_timing=True)
+
+        sync_all_device()
         forward_start_time = time.time()
+
+        fwd_tik.record()
+
         output = model(data)
         output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
         loss = criterion(output.view(-1, ntokens), targets)
-        forward_elapsed.append((time.time() - forward_start_time) * 1000)
-        backward_start_time = time.time()
-        loss.backward()
-        backward_elapsed.append((time.time() - backward_start_time) * 1000)
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        optimizer.step()
         total_loss += loss.item()
 
-        if batch % args.log_interval == 0:
+        fwd_tok.record()
+        fwd_tok.synchronize()
+        fwd_delay = fwd_tik.elapsed_time(fwd_tok)
+
+        forward_cuda_elapsed.append(fwd_delay)
+
+        sync_all_device()
+        forward_pyth_elapsed.append((time.time() - forward_start_time) * 1000)
+
+        bwd_tik = torch.cuda.Event(enable_timing=True)
+        bwd_tok = torch.cuda.Event(enable_timing=True)
+
+        backward_start_time = time.time()
+
+        bwd_tik.record()
+
+        loss.backward()
+
+        bwd_tok.record()
+        bwd_tok.synchronize()
+        bwd_delay = bwd_tik.elapsed_time(bwd_tok)
+
+        backward_cuda_elapsed.append(bwd_delay)
+
+        sync_all_device()
+        backward_pyth_elapsed.append((time.time() - backward_start_time) * 1000)
+
+        optimizer.step()
+
+        if (batch + 1) % args.log_interval == 0:
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | forward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | backward {:5.2f}±{:5.2f}({:5.2f},min={:5.2f},max={:5.2f}) | '
-                    'loss {:5.2f} | ppl {:8.2f}'.format(epoch, batch,
-                                                        len(train_data) // (args.bptt * args.batch_size),
-                                                        args.lr,
-                                                        elapsed * 1000 / args.log_interval,
-                                                        statistics.mean(forward_elapsed),
-                                                        statistics.stdev(forward_elapsed) if len(forward_elapsed) > 1 else 0.0,
-                                                        forward_elapsed[-1],
-                                                        min(forward_elapsed),
-                                                        max(forward_elapsed),
-                                                        statistics.mean(backward_elapsed),
-                                                        statistics.stdev(backward_elapsed) if len(backward_elapsed) > 1 else 0.0,
-                                                        backward_elapsed[-1],
-                                                        min(backward_elapsed),
-                                                        max(backward_elapsed),
-                                                        cur_loss, math.exp(cur_loss)))
+
+            num_of_batches = len(train_data) // (args.bptt * args.batch_size)
+
+            f_last = forward_cuda_elapsed[-(len(forward_cuda_elapsed) // 2):]
+            f_last_mean = statistics.mean(f_last)
+            f_last_std = statistics.stdev(f_last) if len(f_last) > 1 else 0.0
+
+            b_last = backward_cuda_elapsed[-(len(backward_cuda_elapsed) //2):]
+            b_last_mean = statistics.mean(b_last)
+            b_last_std = statistics.stdev(b_last) if len(b_last) > 1 else 0.0
+
+            print(
+                f"EPOCH:{epoch:2}|"
+                f"BATCH:{(batch + 1):3}/{num_of_batches:3}|"
+                f"LOSS:{cur_loss:5.2f}|"
+                "\t"
+                f"TIME:{(elapsed * 1000 / args.log_interval):10.2f} = {forward_pyth_elapsed[-1]:10.2f} + {backward_pyth_elapsed[-1]:10.2f}|"
+                "\t"
+                f"FORWARD:{forward_cuda_elapsed[-1]:10.2f} = {f_last[-1]:10.2f}({f_last_mean:10.2f} ±{f_last_std:8.2f})|"
+                "\t"
+                f"BACKWARD:{backward_cuda_elapsed[-1]:10.2f}({b_last_mean:10.2f} ±{b_last_std:8.2f})|"
+            )
+
             total_loss = 0
             start_time = time.time()
 
