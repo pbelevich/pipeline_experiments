@@ -54,19 +54,71 @@ class Loss(nn.Module):
         #print("INPUT:", input.sum().item())
         return self.criterion(input.view(-1, self.ntokens), target.to(input.device))
 
+class Timer(object):
+    ALL = []
+    def __init__(self, name):
+            self._elapsed = 0.0
+            self._name = name
+            self._start_time = None
+            self._children = {}
+            self._count = 0
+            Timer.ALL.append(self)
 
-def run_batch(optimizer, model, loss_module, data, lm_mask, targets):
+    def __enter__(self):
+            self._start_time = time.time()
+            self._count += 1
+            return self
+
+    def __exit__(self, *_):
+            self._elapsed += time.time() - self._start_time
+            self._start_time = None
+
+    @property
+    def name(self):
+        return self._name
+
+    def avg(self):
+        if self._count == 0: return 0
+        return self._elapsed / self._count
+
+    @classmethod
+    def report(cls):
+        r = {}
+        for t in cls.ALL:
+            r[t.name] = t.avg()
+        print(r)
+
+
+timer_fwd = Timer('forward')    
+timer_loss = Timer('loss')    
+timer_bwd = Timer('backward')    
+timer_sync = Timer('sync')    
+timer_step = Timer('step')    
+timer_sync2 = Timer('sync2')    
+
+
+def get_item(rref, is_remote):
+    if is_remote:
+        return rpc.rpc_sync(rref.owner(), get_item, (rref, False))
+    return rref.local_value().view(-1)[0].item()
+
+def run_batch(args, optimizer, model, loss_module, data, lm_mask, targets):
     with dist_autograd.context() as context_id:
-        #data = data.to(0)
         data = data.transpose(0, 1)
-        output = model(data)
-        #print("OUTPUT:", output.sum().item())
-        #output = rpc.RRef(output)
-        loss = loss_module(output, rpc.RRef(targets)).to_here()
-        #return loss.item()
-        dist_autograd.backward(context_id, [loss])
-        # torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip)
-        optimizer.step(context_id)
+        with timer_fwd:
+            output = model(data)
+            output_item = get_item(output, True)
+        with timer_loss:
+            loss = loss_module(output, rpc.RRef(targets)).to_here()
+            loss_item = loss.item()
+        with timer_bwd:
+            dist_autograd.backward(context_id, [loss])
+            with timer_sync:
+                sync_devices(args)
+        with timer_step:
+            optimizer.step(context_id)
+            with timer_sync2:
+                sync_devices(args)
 
     return loss.item()
 
@@ -85,7 +137,7 @@ def train(model, vocab, train_loss_log, train_data,
 
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
         try:
-            loss = run_batch(optimizer, model, loss_module, data, lm_mask, targets)
+            loss = run_batch(args, optimizer, model, loss_module, data, lm_mask, targets)
         except:
             #print(rpc.rpc_sync("w3", torch.cuda.memory_stats, args=(3,)))
             #time.sleep(60)
@@ -94,7 +146,8 @@ def train(model, vocab, train_loss_log, train_data,
         print("LOSS:", "%0.3f" % (loss,))
         total_loss += loss
 
-        if batch % args.log_interval == 0 and batch > 0:
+        if batch % args.log_interval == (args.log_interval - 1) and batch > 0:
+            Timer.report()
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
@@ -128,6 +181,12 @@ def dumpstacks(signal, frame):
                 code.append("  %s" % (line.strip()))
     print("\n".join(code))
 
+def sync_devices(args):
+    ngpus = args.world_size // args.num_workers
+    futs = []
+    for i in range(args.world_size):
+        futs.append(rpc.rpc_async(f"w{i}", torch.cuda.synchronize, (i%ngpus,)))
+    torch.futures.wait_all(futs)
 
 def run_main(args):
 
@@ -193,24 +252,34 @@ def run_main(args):
     print(f"Vocabulary size = {ntokens}")
 
     ngpus = args.world_size // args.num_workers
+    def get_remote_device(i):
+        return f"w{i}/cuda:{i % ngpus}"
 
-    layers = [RemoteModule("w0/cuda:0", MLMTaskEmbedding, (ntokens, args.emsize))]
+    layers = [RemoteModule(get_remote_device(0), MLMTaskEmbedding, (ntokens, args.emsize))]
     n_encoders = args.nlayers
-    num_parts = min(n_encoders, args.world_size-3)
-    for di, device in enumerate([f"w{i}/cuda:{i % ngpus}" for i in range(1, num_parts+1)]):
+    skip_start_layers = int(args.ep_embedding)
+    skip_end_layers = int(args.ep_head) + int(args.ep_noop)
+    num_parts = min(n_encoders, args.world_size-skip_start_layers-skip_end_layers)
+    for di, device in enumerate([get_remote_device(i) for i in range(skip_start_layers, num_parts+skip_start_layers)]):
         this_encoders = n_encoders // (num_parts-di)
         layers.append(RemoteModule(device, MLMTaskEncoder, (args.emsize,  args.nhead, args.nhid, this_encoders, args.dropout)))
         n_encoders -= this_encoders
-    layers.append(RemoteModule(f"w{num_parts+1}/cuda:{(num_parts+1) % ngpus}", MLMTaskHead, (ntokens, args.emsize)))
-    layers.append(RemoteModule(f"w{num_parts+2}/cuda:{(num_parts+2) % ngpus}", NoOp, ()))
+    next_layer = num_parts + skip_start_layers - 1
+    if args.ep_head:
+        next_layer += 1
+    layers.append(RemoteModule(get_remote_device(next_layer), MLMTaskHead, (ntokens, args.emsize)))
+    if args.ep_noop:
+        next_layer += 1
+        layers.append(RemoteModule(get_remote_device(next_layer), NoOp, ()))
+
     org_model = nn.Sequential(*layers)
 
     graph = make_graph(org_model)
     #for node in graph.nodes: print(node.module.on, node.get_name())
-    model = DistributedPipeline(graph, chunks=min(args.world_size, args.batch_size))
+    model = DistributedPipeline(graph, chunks=args.num_chunks if args.num_chunks else min(args.world_size, args.batch_size))
 
-    params = sum([torch.prod(torch.tensor(p.rpc_sync().size())) for p in model.parameter_rrefs()])
-    print(f'Total parameters = {int(params.item() // 1e6)}M')
+    params = sum([torch.prod(torch.tensor(p.rpc_sync().size())).item() for p in model.parameter_rrefs()])
+    print(f'Total parameters = {int(params // 1e6)}M')
 
     criterion = nn.CrossEntropyLoss()
     optimizer = DistributedOptimizer(
@@ -301,11 +370,17 @@ if __name__ == "__main__":
                         help="Global rank of this process. Pass in 0 for master.")
     parser.add_argument('--gpus', type=int, default=1,
                         help='number of GPUs per worker node to use')
+    parser.add_argument('--num_chunks', type=int, default=0,
+                        help='number of GPUs per worker node to use')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='number of GPUs per worker node to use')
     parser.add_argument('--rpc', type=str, default='cpu',
                         help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')
     parser.add_argument('--num_batch', type=int, default=0)
+    parser.add_argument('--ep_embedding', dest='ep_embedding', action='store_true')
+    parser.add_argument('--ep_head', dest='ep_head', action='store_true')
+    parser.add_argument('--ep_noop', dest='ep_noop', action='store_true')
+    parser.set_defaults(ep_embedding=False, ep_head=False, ep_noop=False)
     args = parser.parse_args()
 
     assert args.world_size % args.num_workers == 0
