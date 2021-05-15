@@ -29,10 +29,13 @@ class DistributedCUDARPCSequential(nn.Module):
             for x in iter(xs.split(self.microbatch_size, dim=0)):
                 x_rref = RRef(x)
                 for worker_layer in self.worker_layers[:-1]:
-                    x_rref = worker_layer.forward(x_rref)
+                    x_rref = worker_layer(x_rref)
                 z_fut = self.worker_layers[-1].remote_module.rpc_async().forward(x_rref)
                 out_futures.append(z_fut)
             return torch.cat(torch.futures.wait_all(out_futures))
+
+    def get_fwd_compute_delay(self):
+        return sum([worker_layer.get_fwd_compute_delay() for worker_layer in self.worker_layers])
 
     def train(self, mode=True):
         for worker_layer in self.worker_layers:
@@ -66,6 +69,9 @@ class WorkerModule(nn.Module):
     def forward(self, x_rref):
         return self.remote_module.remote().forward(x_rref)
 
+    def get_fwd_compute_delay(self):
+        return self.remote_module.rpc_sync().get_fwd_compute_delay()
+
     def parameter_rrefs(self):
         return self.remote_module.remote().parameter_rrefs()
 
@@ -77,6 +83,8 @@ class LocalWrapper(nn.Module):
         first_parameter = next(self.local_net.parameters(), None)
         self.first_device = local_net_creator.device
         self._lock = threading.Lock()
+        self.fwd_tik = torch.cuda.Event(enable_timing=True)
+        self.fwd_tok = torch.cuda.Event(enable_timing=True)
 
     def train(self, mode=True):
         self.local_net.train(mode=mode)
@@ -84,8 +92,16 @@ class LocalWrapper(nn.Module):
     def forward(self, x_rref):
         x = x_rref.to_here()
         with self._lock:
+            # NB: the two cuda events below records the comp
+            # delay on this shard
+            self.fwd_tik.record()
             res = self.local_net(x)
+            self.fwd_tok.record()
         return res
+
+    def get_fwd_compute_delay(self):
+        self.fwd_tok.synchronize()
+        return self.fwd_tik.elapsed_time(self.fwd_tok)
 
     def parameter_rrefs(self):
         return [RRef(p) for p in self.local_net.parameters()]

@@ -29,6 +29,9 @@ class DistributedCUDARPCSequential(nn.Module):
             x = x.to_here()
         return x
 
+    def get_fwd_compute_delay(self):
+        return sum([worker_layer.get_fwd_compute_delay() for worker_layer in self.worker_layers])
+
     def train(self, mode=True):
         self.first_shard.rpc_sync().train(mode=mode)
 
@@ -50,6 +53,9 @@ class WorkerModule():
     def materialize(self):
         self.remote_module = rpc.remote(self.worker, LocalWrapper, args=(self.remote_class_creator, *(self.args)), kwargs=self.kwargs)
 
+    def get_fwd_compute_delay(self):
+        return self.remote_module.rpc_sync().get_fwd_compute_delay()
+
 
 class LocalWrapper(nn.Module):
     def __init__(self, local_net_creator, *args, **kwargs):
@@ -57,6 +63,8 @@ class LocalWrapper(nn.Module):
         self.local_net = local_net_creator(*args, **kwargs)
         self.next_shard = None
         self._lock = threading.Lock()
+        self.fwd_tik = torch.cuda.Event(enable_timing=True)
+        self.fwd_tok = torch.cuda.Event(enable_timing=True)
 
     def set_next_shard(self, next_shard):
         self.next_shard = next_shard
@@ -68,10 +76,18 @@ class LocalWrapper(nn.Module):
 
     def forward(self, x):
         with self._lock:
+            # NB: the two cuda events below records the comp
+            # delay on this shard
+            self.fwd_tik.record()
             x = self.local_net(x)
+            self.fwd_tok.record()
         if self.next_shard is not None:
             return self.next_shard.remote().forward(x)
         return x
+
+    def get_fwd_compute_delay(self):
+        self.fwd_tok.synchronize()
+        return self.fwd_tik.elapsed_time(self.fwd_tok)
 
     def parameter_rrefs(self):
         param_rrefs = [RRef(p) for p in self.local_net.parameters()]
