@@ -1,3 +1,4 @@
+import torch
 import torch.nn as nn
 
 class LocalSequential(nn.Sequential):
@@ -10,3 +11,10 @@ class LocalSequential(nn.Sequential):
             x = x.to(device)
             x = layer(x)
         return x
+
+
+# assuming CUDA_VISIBLE_DEVICES are configured in a way that each process only sees
+# an exclusive set of device
+def sync_all_device(gpus):
+  for d in range(gpus):
+    torch.cuda.synchronize(d)
