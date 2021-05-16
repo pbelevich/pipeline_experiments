@@ -15,6 +15,6 @@ class LocalSequential(nn.Sequential):
 
 # assuming CUDA_VISIBLE_DEVICES are configured in a way that each process only sees
 # an exclusive set of device
-def sync_all_device():
-  for d in range(torch.cuda.device_count()):
+def sync_all_device(gpus):
+  for d in range(gpus):
     torch.cuda.synchronize(d)

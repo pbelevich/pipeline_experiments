@@ -121,15 +121,21 @@ def train(model, vocab, train_loss_log, train_data,
 
             num_of_batches = len(train_data) // (args.bptt * args.batch_size)
 
-            f_comm_last = forward_comm_elapsed[-(len(forward_comm_elapsed) // 2):]
+            last = 10 # len(forward_comm_elapsed) // 2
+
+            f_comm_last = forward_comm_elapsed[-last:]
             f_comm_last_mean = statistics.mean(f_comm_last)
             f_comm_last_std = statistics.stdev(f_comm_last) if len(f_comm_last) > 1 else 0.0
 
-            f_comp_last = forward_comp_elapsed[-(len(forward_comp_elapsed) // 2):]
+            f_comp_last = forward_comp_elapsed[-last:]
             f_comp_last_mean = statistics.mean(f_comp_last)
             f_comp_last_std = statistics.stdev(f_comp_last) if len(f_comp_last) > 1 else 0.0
 
-            b_last = backward_cuda_elapsed[-(len(backward_cuda_elapsed) //2):]
+            f_last = forward_cuda_elapsed[-last:]
+            f_last_mean = statistics.mean(f_last)
+            f_last_std = statistics.stdev(f_last) if len(f_last) > 1 else 0.0
+
+            b_last = backward_cuda_elapsed[-last:]
             b_last_mean = statistics.mean(b_last)
             b_last_std = statistics.stdev(b_last) if len(b_last) > 1 else 0.0
 
@@ -140,7 +146,7 @@ def train(model, vocab, train_loss_log, train_data,
                 "\t"
                 f"TIME:{(elapsed * 1000 / args.log_interval):10.2f} = {forward_pyth_elapsed[-1]:10.2f} + {backward_pyth_elapsed[-1]:10.2f}|"
                 "\t"
-                f"FORWARD:{forward_cuda_elapsed[-1]:10.2f} = {f_comm_last[-1]:10.2f}({f_comm_last_mean:10.2f} ±{f_comm_last_std:8.2f}) + {f_comp_last[-1]:10.2f}({f_comp_last_mean:10.2f} ±{f_comp_last_std:8.2f})|"
+                f"FORWARD:{forward_cuda_elapsed[-1]:10.2f}({f_last_mean:10.2f} ±{f_last_std:8.2f})=({f_comp_last_mean:10.2f} ±{f_comp_last_std:8.2f})+({f_comm_last_mean:10.2f} ±{f_comm_last_std:8.2f}) |"
                 "\t"
                 f"BACKWARD:{backward_cuda_elapsed[-1]:10.2f}({b_last_mean:10.2f} ±{b_last_std:8.2f})|"
             )

@@ -65,7 +65,7 @@ def train(model, vocab, train_loss_log, train_data,
         fwd_tik = torch.cuda.Event(enable_timing=True)
         fwd_tok = torch.cuda.Event(enable_timing=True)
 
-        sync_all_device()
+        sync_all_device(args.gpus)
         forward_start_time = time.time()
 
         fwd_tik.record()
@@ -81,7 +81,7 @@ def train(model, vocab, train_loss_log, train_data,
 
         forward_cuda_elapsed.append(fwd_delay)
 
-        sync_all_device()
+        sync_all_device(args.gpus)
         forward_pyth_elapsed.append((time.time() - forward_start_time) * 1000)
 
         bwd_tik = torch.cuda.Event(enable_timing=True)
@@ -99,7 +99,7 @@ def train(model, vocab, train_loss_log, train_data,
 
         backward_cuda_elapsed.append(bwd_delay)
 
-        sync_all_device()
+        sync_all_device(args.gpus)
         backward_pyth_elapsed.append((time.time() - backward_start_time) * 1000)
 
         optimizer.step()
@@ -126,7 +126,7 @@ def train(model, vocab, train_loss_log, train_data,
                 "\t"
                 f"TIME:{(elapsed * 1000 / args.log_interval):10.2f} = {forward_pyth_elapsed[-1]:10.2f} + {backward_pyth_elapsed[-1]:10.2f}|"
                 "\t"
-                f"FORWARD:{forward_cuda_elapsed[-1]:10.2f} = {f_last[-1]:10.2f}({f_last_mean:10.2f} ±{f_last_std:8.2f})|"
+                f"FORWARD:{forward_cuda_elapsed[-1]:10.2f}({f_last_mean:10.2f} ±{f_last_std:8.2f})|"
                 "\t"
                 f"BACKWARD:{backward_cuda_elapsed[-1]:10.2f}({b_last_mean:10.2f} ±{b_last_std:8.2f})|"
             )
