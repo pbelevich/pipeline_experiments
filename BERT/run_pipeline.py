@@ -135,7 +135,9 @@ def train(model, vocab, train_loss_log, train_data,
 
     loss_module = DistributedLoss(Loss, criterion, ntokens)
 
+    num_words = 0
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
+        num_words += targets.numel()
         try:
             loss = run_batch(args, optimizer, model, loss_module, data, lm_mask, targets)
         except:
@@ -151,15 +153,15 @@ def train(model, vocab, train_loss_log, train_data,
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
-            print('| epoch {:3d} | {:5d}/{:5d} batches | lr {:05.5f} | ms/batch {:5.2f} | '
-                    'loss {:5.2f}'.format(epoch, batch,
-                                                        len(train_data) // (args.bptt * args.batch_size),
-                                                        args.lr,
-                                                        elapsed * 1000 / args.log_interval,
-                                                        cur_loss))
+            print(' wps: {:0.2f} | {:5d}/{:5d} batches | s/batch {:5.2f} | loss {:5.2f}'
+                    .format(num_words / elapsed,  batch,
+                        len(train_data) // (args.bptt * args.batch_size),
+                        elapsed / args.log_interval,
+                        cur_loss))
             if args.num_batch > 0 and batch >= args.num_batch:
                 break
             total_loss = 0
+            num_words = 0
             start_time = time.time()
 
 

@@ -1,11 +1,12 @@
 #!/bin/bash
 
-chunks=8
-ws=8
+chunks=50
+ws=104
 nodes=$(((ws+7)/8))
-bs=256
-model=BERT1.2
-#model=GPT175
+bs=100
+#model=BERT1.2
+model=GPT175
+#model=test
 
 model_params="--batch_size $bs --num_chunks=$chunks --world_size=$ws --num_workers=$nodes  --num_batch=30 --epochs=1"
 
@@ -28,11 +29,14 @@ echo \$MASTER_ADDR
 
 set -x
 #srun -u python3 -m BERT.run_pipeline $model_params --nlayers=36 --emsize=2048 --nhid=10240 --nhead=32
-#srun -u python3 -m BERT.run_pipeline $model_params --nlayers=96 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
 #srun -u python3 -m BERT.run_pipeline $model_params  --nlayers=5 --emsize=12288 --nhid=49152 --nhead=16
+srun -u python3 -m BERT.run_pipeline $model_params --nlayers=96 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
 
 #BERT 1.2B:
-srun -u python3 -m BERT.run_pipeline $model_params --nlayers=24 --emsize=2048 --nhid=8192 --nhead=16
+#srun -u python3 -m BERT.run_pipeline $model_params --nlayers=24 --emsize=2048 --nhid=8192 --nhead=16
+
+#TEST
+#srun -u python3 -m BERT.run_pipeline $model_params --nlayers=4 --emsize=256 --nhid=1024 --nhead=16
 
 EOT
 
