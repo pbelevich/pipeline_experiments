@@ -1,10 +1,11 @@
 #!/bin/bash
 
-chunks=2
-ws=2
+chunks=8
+ws=8
 nodes=$(((ws+7)/8))
-bs=32
+bs=256
 model=BERT1.2
+#model=GPT175
 
 model_params="--batch_size $bs --num_chunks=$chunks --world_size=$ws --num_workers=$nodes  --num_batch=30 --epochs=1"
 
@@ -18,7 +19,7 @@ sbatch <<EOT
 #SBATCH --nodes $nodes
 #SBATCH --partition=q3
 #SBATCH --ntasks-per-node 1
-#SBATCH --time=6:00:00
+#SBATCH --time=3:00:00
 
 
 export MASTER_ADDR=\$(srun --ntasks=1 hostname 2>&1 | tail -n1)
