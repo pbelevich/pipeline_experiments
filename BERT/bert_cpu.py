@@ -66,6 +66,7 @@ def train(model, vocab, train_loss_log, train_data,
     backward_cuda_elapsed = []
 
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
+        targets = targets.to(0)
         with dist_autograd.context() as context_id:
             data = data.transpose(0, 1)
 
@@ -77,7 +78,7 @@ def train(model, vocab, train_loss_log, train_data,
 
             fwd_tik.record()
 
-            output = model(data)
+            output = model(data).to(0)
             output = torch.stack([output[i] for i in range(lm_mask.size(0)) if lm_mask[i]])
             loss = criterion(output.view(-1, ntokens), targets)
             total_loss += loss.item()
