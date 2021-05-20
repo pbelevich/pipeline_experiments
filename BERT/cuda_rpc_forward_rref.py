@@ -106,6 +106,8 @@ class LocalWrapper(nn.Module):
     def parameter_rrefs(self):
         return [RRef(p) for p in self.local_net.parameters()]
 
+    def __getstate__(self):
+        return {}
 
 def get_my_gpu_index():
     try:

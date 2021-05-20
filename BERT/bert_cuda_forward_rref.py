@@ -64,7 +64,11 @@ def train(model, vocab, train_loss_log, train_data,
     backward_pyth_elapsed = []
     backward_cuda_elapsed = []
 
+    i = 0
     for batch, (data, lm_mask, targets) in enumerate(dataloader):
+        i += 1
+        if i >= 5:
+            break
         data = data.to(0)
         targets = targets.to(0)
         with dist_autograd.context() as context_id:
@@ -291,6 +295,7 @@ def run_worker(rank, world_size, args):
     else:
         if args.rank is None:
             os.environ['CUDA_VISIBLE_DEVICES'] = str(rank - 1)
+            os.environ['CUDA_LAUNCH_BLOCKING'] = "1"
 
         options.set_device_map(f"worker{rank - 1}" if rank > 1 else "master", {0: 0})
 
