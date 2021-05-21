@@ -57,12 +57,16 @@ class Loss(nn.Module):
 class Timer(object):
     ALL = []
     def __init__(self, name):
-            self._elapsed = 0.0
             self._name = name
-            self._start_time = None
             self._children = {}
-            self._count = 0
+            self._start_time = None
+            self.reset()
             Timer.ALL.append(self)
+
+    def reset(self):
+        self._elapsed = 0.0
+        self._elapsed_sqr = 0.0
+        self._count = 0
 
     def __enter__(self):
             self._start_time = time.time()
@@ -70,7 +74,9 @@ class Timer(object):
             return self
 
     def __exit__(self, *_):
-            self._elapsed += time.time() - self._start_time
+            delta = time.time() - self._start_time
+            self._elapsed += delta
+            self._elapsed_sqr += delta * delta
             self._start_time = None
 
     @property
@@ -81,13 +87,25 @@ class Timer(object):
         if self._count == 0: return 0
         return self._elapsed / self._count
 
+    def std_dev(self):
+        if self._count == 0: return 
+        avg = self._elapsed / self._count
+        return math.sqrt(self._elapsed_sqr / self._count - avg * avg)
+
+
     @classmethod
     def report(cls):
         r = {}
+        s = {}
         for t in cls.ALL:
             r[t.name] = t.avg()
-        print(r)
+            s[t.name] = t.std_dev()
+        print({"avg": r, "var": s})
 
+    @classmethod
+    def reset_all(cls):
+        for t in cls.ALL:
+            t.reset()
 
 timer_fwd = Timer('forward')    
 timer_loss = Timer('loss')    
@@ -150,6 +168,7 @@ def train(model, vocab, train_loss_log, train_data,
 
         if batch % args.log_interval == (args.log_interval - 1) and batch > 0:
             Timer.report()
+            Timer.reset_all()
             cur_loss = total_loss / args.log_interval
             elapsed = time.time() - start_time
             train_loss_log[-1] = cur_loss
