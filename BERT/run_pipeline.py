@@ -4,6 +4,7 @@ import math
 import sys
 import time
 import os
+import psutil
 
 import torch
 import torch.distributed as dist
@@ -316,17 +317,29 @@ def run_main(args):
         train(model, train_dataset.vocab, train_loss_log, train_data,
               optimizer, criterion, ntokens, epoch, args)
 
-
 def run_worker(rank, args):
+    n_gpu  = args.world_size // args.num_workers
 
+    if rank < 1:
+        psutil.Process().cpu_affinity([0,1])
+
+    n_cpu = psutil.cpu_count()
+    aff = [(rank + 1 + i) % n_cpu for i in range(n_cpu // 3)]
+    if rank < 0:
+        rank = 0
+        is_master = True
+    else:
+        is_master = False
 
     signal.signal(signal.SIGUSR1, dumpstacks) 
 
-    first_rank = (args.world_size // args.num_workers) * int(os.environ.get('SLURM_PROCID', '0'))
+
+    first_rank = n_gpu * int(os.environ.get('SLURM_PROCID', '0'))
     rank += first_rank
 
-    if rank==first_rank:
-        print("rank:", rank, "pid", os.getpid())
+
+    if True:# rank==first_rank or is_master:
+        print("rank:", -1 if is_master else rank, "pid", os.getpid())
     torch.cuda.set_per_process_memory_fraction(0.9, rank - first_rank)
     torch.manual_seed(args.seed)
     os.environ['MASTER_ADDR'] = os.environ.get("MASTER_ADDR", "127.0.0.1")
@@ -334,14 +347,15 @@ def run_worker(rank, args):
     options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=3600)
     for i in range(args.world_size):
         options.set_device_map(f"w{i}", {rank - first_rank: i % (args.world_size // args.num_workers)})
+    options.set_device_map("master", {rank - first_rank: 0})
     rpc.init_rpc(
-        f"w{rank}",
-        rank=rank,
-        world_size=args.world_size,
+        "master" if is_master else  f"w{rank}",
+        rank=args.world_size if is_master else rank,
+        world_size=args.world_size + 1,
         rpc_backend_options=options
     )
 
-    if rank == 0:
+    if is_master:
         run_main(args)
 
     rpc.shutdown()
@@ -406,5 +420,7 @@ if __name__ == "__main__":
 
     assert args.world_size % args.num_workers == 0
 
-    #run_worker(args.rank, args.world_size, args)
-    mp.spawn(run_worker, args=(args,), nprocs=args.world_size // args.num_workers)
+    c=mp.spawn(run_worker, args=(args,), nprocs=args.world_size // args.num_workers, join=False)
+    if int(os.environ.get('SLURM_PROCID', '0')) == 0:
+        run_worker(-1, args)
+    c.join()
