@@ -15,10 +15,12 @@ import torch.distributed.rpc as rpc
 from torch.distributed.optim import DistributedOptimizer
 import torch.distributed.autograd as dist_autograd
 
-from .model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead
+from .model import MLMTask, MLMTask2, MLMTaskEmbedding, MLMTaskEncoder, MLMTaskHead, process_groups_map, ShardedTransformerEncoderLayer, OutputCollectorModule, LogRecord, Print
 
 from fairscale.experimental.nn.distributed_pipeline import DistributedLoss, DistributedPipeline, PipelineModulesGraph
 from fairscale.experimental.nn.distributed_pipeline.trace import make_graph
+
+ws_perm = None
 
 
 def collate_batch(batch_data, args, mask_id, cls_id):
@@ -52,8 +54,13 @@ class Loss(nn.Module):
         #self.criterion = nn.CrossEntropyLoss()
 
     def forward(self, input, target):
-        #print("INPUT:", input.sum().item())
-        return self.criterion(input.view(-1, self.ntokens), target.to(input.device))
+        #print("INPUT:", input.shape)
+        #print("LOSS COPYING", target.device, "with shape", target.shape, "TO", input.device, flush=True)
+        target = target.to(input.device)
+        #print("LOSS COMPUTING", flush=True)
+        result = self.criterion(input.view(-1, self.ntokens), target)
+        #print("LOSS COMPUTED", flush=True)
+        return result
 
 class Timer(object):
     ALL = []
@@ -119,7 +126,10 @@ timer_sync2 = Timer('sync2')
 def get_item(rref, is_remote):
     if is_remote:
         return rpc.rpc_sync(rref.owner(), get_item, (rref, False))
-    return rref.local_value().view(-1)[0].item()
+    #print("GET_ITEM started", flush=True)
+    result = rref.local_value().view(-1)[0].item()
+    #print("GET_ITEM done", flush=True)
+    return result
 
 def run_batch(args, optimizer, model, loss_module, data, lm_mask, targets):
     with dist_autograd.context() as context_id:
@@ -128,8 +138,9 @@ def run_batch(args, optimizer, model, loss_module, data, lm_mask, targets):
             output = model(data)
             output_item = get_item(output, True)
         with timer_loss:
-            loss = loss_module(output, rpc.RRef(targets)).to_here()
+            loss = loss_module(output, rpc.RRef(targets.to(0))).to_here()
             loss_item = loss.item()
+        #return loss_item
         with timer_bwd:
             dist_autograd.backward(context_id, [loss])
             with timer_sync:
@@ -210,7 +221,67 @@ def sync_devices(args):
         futs.append(rpc.rpc_async(f"w{i}", torch.cuda.synchronize, (i%ngpus,)))
     torch.futures.wait_all(futs)
 
-def run_main(args):
+class UnwrapParrams(nn.Module):
+    def __init__(self, m):
+        super(UnwrapParrams, self).__init__()
+        self.module = m
+
+    def forward(self, inputs):
+        return self.module(*inputs)
+
+
+def extract_partitions(graph: PipelineModulesGraph, pipeline: DistributedPipeline):
+    return [list(map(graph.nodes.index, p.nodes)) for p in pipeline.partitions]
+
+class ModelConfig:
+    def __init__(self, args):
+        self.args = args
+        self.skip_start_layers = int(args.ep_embedding)
+        self.skip_end_layers = int(args.ep_head) + int(args.ep_noop)
+        self.ngpus = args.world_size // args.num_workers
+
+    def get_remote_device(self, i):
+        i = ws_perm[i]
+        return f"w{i}/cuda:{i % self.ngpus}"
+
+    def init_process_groups(self, args):
+        if (args.nshards < 2):
+            return
+        my_rank = dist.get_rank()
+        num_parts = min((args.nlayers+args.nshards-1) // args.nshards, args.world_size-self.skip_start_layers-self.skip_end_layers)
+        for di in range(num_parts):
+            ranks = [di*args.nshards + self.skip_start_layers + i for i in range(args.nshards)]
+            if my_rank in ranks:
+                print(f"added {my_rank} to group l{di}")
+            process_groups_map[f"l{di}"] = dist.new_group(ranks = [ws_perm[i] for i in ranks])
+
+    def create_layers(self, ntokens):
+        args = self.args
+
+        layers = [RemoteModule(self.get_remote_device(0), MLMTaskEmbedding, (ntokens, args.emsize))]
+        num_parts = min((args.nlayers+args.nshards-1) // args.nshards, args.world_size-self.skip_start_layers-self.skip_end_layers)
+        print(f"num_parts={num_parts}, n_encoders={args.nlayers}, ws={args.world_size}, sk-st={self.skip_start_layers}, sk-end={self.skip_end_layers}")
+        for di in range(num_parts):
+            this_encoders = args.nlayers // (num_parts-di)
+            ranks = [di*args.nshards + self.skip_start_layers + i for i in range(args.nshards)]
+            if len(ranks) == 1:
+                layers.append(RemoteModule(self.get_remote_device(ranks[0]), MLMTaskEncoder, (args.emsize,  args.nhead, args.nhid, this_encoders, args.dropout)))
+            else:
+                for i in range(this_encoders):
+                    layers.append(ShardedTransformerEncoderLayer([self.get_remote_device(rank) for rank in ranks], f"l{di}", di==0 and i==0, di+1==num_parts and i+1==this_encoders,  args.emsize,  args.nhead, args.nhid, args.dropout))
+            args.nlayers -= this_encoders
+        next_layer = num_parts * args.nshards + self.skip_start_layers - 1
+        if args.ep_head:
+            next_layer += 1
+        if args.nshards > 1:
+            layers.append(UnwrapParrams(RemoteModule(self.get_remote_device(next_layer), OutputCollectorModule)))
+        layers.append(RemoteModule(self.get_remote_device(next_layer), MLMTaskHead, (ntokens, args.emsize)))
+        if args.ep_noop:
+            next_layer += 1
+            layers.append(RemoteModule(self.get_remote_device(next_layer), NoOp, ()))
+        return layers
+
+def run_main(args, model_config):
 
     import torchtext
     if args.dataset == 'WikiText103':
@@ -273,32 +344,13 @@ def run_main(args):
     ntokens = len(train_dataset.get_vocab())
     print(f"Vocabulary size = {ntokens}")
 
-    ngpus = args.world_size // args.num_workers
-    def get_remote_device(i):
-        return f"w{i}/cuda:{i % ngpus}"
-
-    layers = [RemoteModule(get_remote_device(0), MLMTaskEmbedding, (ntokens, args.emsize))]
-    n_encoders = args.nlayers
-    skip_start_layers = int(args.ep_embedding)
-    skip_end_layers = int(args.ep_head) + int(args.ep_noop)
-    num_parts = min(n_encoders, args.world_size-skip_start_layers-skip_end_layers)
-    for di, device in enumerate([get_remote_device(i) for i in range(skip_start_layers, num_parts+skip_start_layers)]):
-        this_encoders = n_encoders // (num_parts-di)
-        layers.append(RemoteModule(device, MLMTaskEncoder, (args.emsize,  args.nhead, args.nhid, this_encoders, args.dropout)))
-        n_encoders -= this_encoders
-    next_layer = num_parts + skip_start_layers - 1
-    if args.ep_head:
-        next_layer += 1
-    layers.append(RemoteModule(get_remote_device(next_layer), MLMTaskHead, (ntokens, args.emsize)))
-    if args.ep_noop:
-        next_layer += 1
-        layers.append(RemoteModule(get_remote_device(next_layer), NoOp, ()))
-
+    layers = model_config.create_layers(ntokens)
     org_model = nn.Sequential(*layers)
 
     graph = make_graph(org_model)
     #for node in graph.nodes: print(node.module.on, node.get_name())
     model = DistributedPipeline(graph, chunks=args.num_chunks if args.num_chunks else min(args.world_size, args.batch_size))
+    print("partittions:", extract_partitions(graph, model))
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())).item() for p in model.parameter_rrefs()])
     print(f'Total parameters = {int(params // 1e6)}M')
@@ -318,45 +370,70 @@ def run_main(args):
               optimizer, criterion, ntokens, epoch, args)
 
 def run_worker(rank, args):
-    n_gpu  = args.world_size // args.num_workers
+    try:
+        n_gpu  = args.world_size // args.num_workers
 
-    if rank < 1:
-        psutil.Process().cpu_affinity([0,1])
+        if rank < 1:
+            psutil.Process().cpu_affinity([0,1])
 
-    n_cpu = psutil.cpu_count()
-    aff = [(rank + 1 + i) % n_cpu for i in range(n_cpu // 3)]
-    if rank < 0:
-        rank = 0
-        is_master = True
-    else:
-        is_master = False
+        n_cpu = psutil.cpu_count()
+        aff = [(rank + 1 + i) % n_cpu for i in range(n_cpu // 3)]
+        if rank < 0:
+            rank = 0
+            is_master = True
+        else:
+            is_master = False
 
-    signal.signal(signal.SIGUSR1, dumpstacks) 
+        signal.signal(signal.SIGUSR1, dumpstacks) 
+
+        global ws_perm
+        if args.ws_perm is None:
+            ws_perm = list(range(self.world_size))
+        else:
+            ws_perm = list(map(int, args.ws_perm.split(',')))
+
+        assert len(ws_perm) == args.world_size
+        assert set(ws_perm) == set(range(args.world_size))
+
+        first_rank = n_gpu * int(os.environ.get('SLURM_PROCID', '0'))
+        rank += first_rank
 
 
-    first_rank = n_gpu * int(os.environ.get('SLURM_PROCID', '0'))
-    rank += first_rank
+        torch.cuda.set_per_process_memory_fraction(0.9, rank - first_rank)
+        torch.manual_seed(args.seed)
+        os.environ['MASTER_ADDR'] = os.environ.get("MASTER_ADDR", "127.0.0.1")
+        os.environ['MASTER_PORT'] = os.environ.get("MASTER_PORT", '29500')
+        options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=90, _transports=["shm", "uv"], _channels=["cma", "mpt_uv", "basic", "cuda_xth", "cuda_ipc", "cuda_basic"])
+        for i in range(args.world_size):
+            options.set_device_map(f"w{i}", {rank - first_rank: i % (args.world_size // args.num_workers)})
+        options.set_device_map("master", {rank - first_rank: 0})
+        rpc.init_rpc(
+            "master" if is_master else  f"w{rank}",
+            rank=args.world_size if is_master else rank,
+            world_size=args.world_size + 1,
+            rpc_backend_options=options
+        )
 
+        dist.init_process_group(
+            rank=args.world_size if is_master else rank,
+            world_size=args.world_size + 1,
+            backend='nccl',
+            init_method='tcp://%s:29501' % (os.environ['MASTER_ADDR'],))
 
-    if True:# rank==first_rank or is_master:
-        print("rank:", -1 if is_master else rank, "pid", os.getpid())
-    torch.cuda.set_per_process_memory_fraction(0.9, rank - first_rank)
-    torch.manual_seed(args.seed)
-    os.environ['MASTER_ADDR'] = os.environ.get("MASTER_ADDR", "127.0.0.1")
-    os.environ['MASTER_PORT'] = os.environ.get("MASTER_PORT", '29500')
-    options = rpc.TensorPipeRpcBackendOptions(num_worker_threads=256, rpc_timeout=3600)
-    for i in range(args.world_size):
-        options.set_device_map(f"w{i}", {rank - first_rank: i % (args.world_size // args.num_workers)})
-    options.set_device_map("master", {rank - first_rank: 0})
-    rpc.init_rpc(
-        "master" if is_master else  f"w{rank}",
-        rank=args.world_size if is_master else rank,
-        world_size=args.world_size + 1,
-        rpc_backend_options=options
-    )
+        model_config = ModelConfig(args)
+        model_config.init_process_groups(args)
 
-    if is_master:
-        run_main(args)
+        if True:# rank==first_rank or is_master:
+            dist_rank = dist.get_rank()
+            print("rank:", dist_rank, "pid", os.getpid())
+            LogRecord.writer = open(f"/tmp/pipeline-{dist_rank}", "w")
+            LogRecord.init()
+
+        if is_master:
+            run_main(args, model_config)
+    except Exception as e:
+        print(f"EXCEPTION on rank {rank}:", e)
+        raise
 
     rpc.shutdown()
 
@@ -409,12 +486,15 @@ if __name__ == "__main__":
                         help='number of GPUs per worker node to use')
     parser.add_argument('--num_workers', type=int, default=1,
                         help='number of GPUs per worker node to use')
+    parser.add_argument('--nshards', type=int, default=1,
+                        help='number of shards')
     parser.add_argument('--rpc', type=str, default='cpu',
                         help='pipeline mode, `cpu` for CPU RPC, `cuda` for CUDA RPC')
     parser.add_argument('--num_batch', type=int, default=0)
     parser.add_argument('--ep_embedding', dest='ep_embedding', action='store_true')
     parser.add_argument('--ep_head', dest='ep_head', action='store_true')
     parser.add_argument('--ep_noop', dest='ep_noop', action='store_true')
+    parser.add_argument('--ws_perm', type=str, default='None')
     parser.set_defaults(ep_embedding=False, ep_head=False, ep_noop=False)
     args = parser.parse_args()
 

@@ -1,10 +1,13 @@
 import torch
+import logging
+import threading
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Linear, Dropout, LayerNorm, TransformerEncoder
 from torchtext.nn import MultiheadAttentionContainer, InProjContainer, ScaledDotProduct
 import torch.distributed.rpc as rpc
-from torch.distributed.rpc import RRef
+import torch.distributed as dist
+from torch.distributed.nn import RemoteModule
 
 
 class PositionalEncoding(nn.Module):
@@ -51,6 +54,169 @@ class BertEmbedding(nn.Module):
             + self.tok_type_embed(src, token_type_input)
         return self.dropout(self.norm(src))
 
+process_groups_map = {}
+
+class LogRecord:
+    seq = 0
+
+    @classmethod
+    def init(cls):
+        cls.lock = threading.Lock()
+
+def log_print(seq, s):
+    #print(f"{dist.get_rank()} {seq} {s}", flush=True)
+    return
+    LogRecord.writer.write(f"{dist.get_rank()} {seq} {s}\n")
+    LogRecord.writer.flush()
+
+class Print(torch.autograd.Function):
+    def forward(ctx, msg, x):
+        ctx.msg = msg
+        #print(f"({dist.get_rank()}): {ctx.msg} (forward)", flush=True)
+        return x
+
+    def backward(ctx, gradient):
+        #print(f"({dist.get_rank()}): {ctx.msg} (backward) device={gradient.device}", flush=True)
+        return None, gradient
+
+
+
+class DistributeFunc(torch.autograd.Function):
+    def forward(ctx, seq, pg, x):
+        ctx.pg = pg
+        ctx.seq= seq
+        return x
+
+    def backward(ctx, gradient):
+        #return None, None, gradient
+        log_print(ctx.seq, "DistributeFunc begin")
+        gradient.view(-1)[0].item()
+        with LogRecord.lock:
+            log_print(ctx.seq, "DistributeFunc with lock")
+            dist.all_reduce(gradient, group=ctx.pg)
+            log_print(ctx.seq, "DistributeFunc after all_reduce")
+            gradient.view(-1)[0].item()
+        log_print(ctx.seq, "DistributeFunc end")
+        return None, None, gradient
+
+class CollectFunc(torch.autograd.Function):
+    def forward(ctx, seq, pg, x):
+        x.view(-1)[0].item()
+        log_print(seq, "CollectFunc begin")
+        with LogRecord.lock:
+            log_print(seq, "CollectFunc locked")
+            dist.all_reduce(x, group=pg)
+            x.view(-1)[0].item()
+        log_print(seq, "CollectFunc end")
+        return x
+
+    def backward(ctx, gradient):
+        return None, None, gradient
+
+class OutputCollector(torch.autograd.Function):
+    def forward(ctx, *x):
+        ctx.num_input = len(x)
+        return x[1]
+
+    def backward(ctx, gradient):
+        return tuple(gradient*1.0 for i in range(ctx.num_input))
+
+class DummyOutput(torch.autograd.Function):
+    def forward(ctx, x):
+        return x#torch.zeros([])
+
+    def backward(ctx, gradient):
+        return gradient
+
+class OutputCollectorModule(nn.Module):
+    def forward(self, *inputs):
+        return Print.apply("OutputCollector", OutputCollector.apply(*inputs))
+
+class TransformerEncoderLayerShard(nn.Module):
+    def __init__(self, pg_name, need_distirbute_input, need_output, d_model, nhead, dim_feedforward,
+                 dropout, activation="gelu"):
+        super(TransformerEncoderLayerShard, self).__init__()
+        logging.info("CONST1")
+        try:
+            self.pg = process_groups_map[pg_name]
+            self.need_distirbute_input = need_distirbute_input
+            self.need_output = need_output
+            assert d_model % self.pg.size() == 0
+            assert self.pg.rank() >= 0
+            sharded_d_model = d_model // self.pg.size()
+            in_proj_container = InProjContainer(Linear(d_model, sharded_d_model),
+                                                Linear(d_model, sharded_d_model),
+                                                Linear(d_model, sharded_d_model))
+            self.mha = MultiheadAttentionContainer(nhead // self.pg.size(), in_proj_container,
+                                                   ScaledDotProduct(), Linear(sharded_d_model, d_model))
+
+            assert dim_feedforward % self.pg.size() == 0
+            dim_feedforward = dim_feedforward // self.pg.size()
+            self.linear1 = Linear(d_model, dim_feedforward)
+            self.dropout = Dropout(dropout)
+            self.linear2 = Linear(dim_feedforward, d_model)
+
+            self.norm1 = LayerNorm(d_model)
+            self.norm2 = LayerNorm(d_model)
+            self.dropout1 = Dropout(dropout)
+            self.dropout2 = Dropout(dropout)
+
+            if activation == "relu":
+                self.activation = F.relu
+            elif activation == "gelu":
+                self.activation = F.gelu
+            else:
+                raise RuntimeError("only relu/gelu are supported, not {}".format(activation))
+        except Exception as e:
+            print("ERROR:", e)
+            raise
+        logging.info("CONST2")
+
+    def init_weights(self):
+        self.mha.in_proj_container.query_proj.init_weights()
+        self.mha.in_proj_container.key_proj.init_weights()
+        self.mha.in_proj_container.value_proj.init_weights()
+        self.mha.out_proj.init_weights()
+        self.linear1.weight.data.normal_(mean=0.0, std=0.02)
+        self.linear2.weight.data.normal_(mean=0.0, std=0.02)
+        self.norm1.bias.data.zero_()
+        self.norm1.weight.data.fill_(1.0)
+        self.norm2.bias.data.zero_()
+        self.norm2.weight.data.fill_(1.0)
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        seq = LogRecord.seq
+        LogRecord.seq += 1
+        src = Print.apply("TRF start", src)
+        if self.need_distirbute_input:
+            src = DistributeFunc.apply(seq, self.pg, src)
+        attn_output, attn_output_weights = self.mha(src, src, src, attn_mask=src_mask)
+        attn_output = CollectFunc.apply(seq, self.pg, attn_output)
+        
+        src = src + self.dropout1(attn_output)
+        src = self.norm1(src)
+        src = DistributeFunc.apply(seq, self.pg, src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src2 = CollectFunc.apply(seq, self.pg, src2)
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        if not self.need_output:
+            src = DummyOutput.apply(src)
+        return Print.apply("TRF end", src)
+
+
+class ShardedTransformerEncoderLayer(nn.Module):
+    def __init__(self, devices, pg_name, single_input, single_output, d_model, nhead, dim_feedforward, dropout):
+        super(ShardedTransformerEncoderLayer, self).__init__()
+        self.shards = nn.ModuleList([RemoteModule(device, TransformerEncoderLayerShard, (
+            pg_name, not single_input, not single_output or i==0,
+            d_model, nhead, dim_feedforward, dropout)) for i, device in enumerate(devices)])
+
+    def forward(self, inputs):
+        if not isinstance(inputs, list):
+            inputs = [inputs] * len(self.shards)
+        assert len(inputs) == len(self.shards)
+        return [shard(input) for shard, input in zip(self.shards, inputs)]
 
 class TransformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048,

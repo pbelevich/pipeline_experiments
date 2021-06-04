@@ -1,11 +1,12 @@
 #!/bin/bash
 
-chunks=10
-ws=8
-nodes=$(((ws+7)/8))
-bs=30
+chunks=2
+ws=4
+nodes=$(((ws+3)/4))
+##nodes=$(((ws+3)/4))
+bs=128
 #model=BERT1.2
-model=GPT1NODE-r
+model=GPT-TEST
 #model=GPT175
 #model=GPT88
 #model=BERT88
@@ -13,17 +14,18 @@ model=GPT1NODE-r
 
 model_params="--batch_size $bs --num_chunks=$chunks --world_size=$ws --num_workers=$nodes  --num_batch=20 --epochs=1"
 
+echo srun -u python3 -m BERT.run_pipeline $model_params --nlayers=96 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
 sbatch <<EOT
 #!/bin/bash
 
 #SBATCH --job-name=pipeline-$model-bs-$bs-ws-$ws-chunks-$chunks
-#SBATCH --output=logs/logs.%x.%t.out
-#SBATCH --error=logs/logs.%x.%t.err
-#SBATCH --gres gpu:8
+#SBATCH --output=logs/0/logs.%x.%t.out
+#SBATCH --error=logs/0/logs.%x.%t.err
+#SBATCH --gres gpu:4
 #SBATCH --nodes $nodes
-#SBATCH --partition=q3
+#SBATCH --partition=dev
 #SBATCH --ntasks-per-node 1
-#SBATCH --cpus-per-task 96
+#SBATCH --cpus-per-task 32
 #SBATCH --time=1:00:00
 
 
@@ -34,10 +36,10 @@ echo \$MASTER_ADDR
 set -x
 
 #GPT1NODE
-srun -u python3 -m BERT.run_pipeline $model_params --nlayers=5 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
+srun -u python3 -m BERT.run_pipeline $model_params --nlayers=1 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
 
 #GPT175
-#srun -u python3 -m BERT.run_pipeline $model_params --nlayers=96 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
+#echo srun -u python3 -m BERT.run_pipeline $model_params --nlayers=96 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
 
 #GPT88
 #srun -u python3 -m BERT.run_pipeline $model_params --nlayers=61 --emsize=12288 --nhid=49152 --nhead=16 --ep_embedding --ep_head --ep_noop
