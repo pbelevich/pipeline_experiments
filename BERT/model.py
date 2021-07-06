@@ -130,13 +130,12 @@ class DummyOutput(torch.autograd.Function):
 
 class OutputCollectorModule(nn.Module):
     def forward(self, *inputs):
-        return Print.apply("OutputCollector", OutputCollector.apply(*inputs))
+        return Print.apply(f"OutputCollector size={len(inputs)}", OutputCollector.apply(*inputs))
 
 class TransformerEncoderLayerShard(nn.Module):
     def __init__(self, pg_name, need_distirbute_input, need_output, d_model, nhead, dim_feedforward,
                  dropout, activation="gelu"):
         super(TransformerEncoderLayerShard, self).__init__()
-        logging.info("CONST1")
         try:
             self.pg = process_groups_map[pg_name]
             self.need_distirbute_input = need_distirbute_input
@@ -170,7 +169,9 @@ class TransformerEncoderLayerShard(nn.Module):
         except Exception as e:
             print("ERROR:", e)
             raise
-        logging.info("CONST2")
+
+    def __getstate__(self):
+          return {}
 
     def init_weights(self):
         self.mha.in_proj_container.query_proj.init_weights()

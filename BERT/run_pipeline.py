@@ -349,7 +349,7 @@ def run_main(args, model_config):
 
     graph = make_graph(org_model)
     #for node in graph.nodes: print(node.module.on, node.get_name())
-    model = DistributedPipeline(graph, chunks=args.num_chunks if args.num_chunks else min(args.world_size, args.batch_size))
+    model = DistributedPipeline(graph, chunks=args.num_chunks if args.num_chunks else min(args.world_size, args.batch_size), wait_for_workers=True)
     print("partittions:", extract_partitions(graph, model))
 
     params = sum([torch.prod(torch.tensor(p.rpc_sync().size())).item() for p in model.parameter_rrefs()])
@@ -392,8 +392,8 @@ def run_worker(rank, args):
         else:
             ws_perm = list(map(int, args.ws_perm.split(',')))
 
-        assert len(ws_perm) == args.world_size
-        assert set(ws_perm) == set(range(args.world_size))
+        assert len(ws_perm) <= args.world_size
+        #assert set(ws_perm) == set(range(args.world_size))
 
         first_rank = n_gpu * int(os.environ.get('SLURM_PROCID', '0'))
         rank += first_rank
@@ -431,6 +431,7 @@ def run_worker(rank, args):
 
         if is_master:
             run_main(args, model_config)
+            print("DONE")
     except Exception as e:
         print(f"EXCEPTION on rank {rank}:", e)
         raise
